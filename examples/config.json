@@ -1,0 +1,27 @@
+{
+    "tmdb": {
+        "api_key": "6c1d224bf19e450428750b415aacd325",
+        "base_url": "https://api.themoviedb.org/3",
+        "image_base_url": "https://image.tmdb.org/t/p/original",
+        "language": "pt-BR"
+    },
+    "database": {
+        "filename": "media.db"
+    },
+    "fetch": {
+        "num_pages": 500,
+        "include_adult": false,
+        "include_video": false,
+        "max_release_date": "",
+        "sort": {
+            "movies": {
+                "field": "popularity",
+                "direction": "desc"
+            },
+            "tv_shows": {
+                "field": "popularity",
+                "direction": "desc"
+            }
+        }
+    }
+}
