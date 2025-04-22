@@ -136,6 +136,44 @@ func main() {
 
 > **Nota:** A biblioteca só precisa da struct preenchida. O usuário pode ler de arquivo, variáveis de ambiente, etc.
 
+## Como trabalhar com Gêneros (Importante)
+
+Para trabalhar corretamente com os gêneros de filmes e séries, é necessário seguir uma ordem específica:
+
+1. **Carregar os Gêneros Primeiro**:
+
+   - Os gêneros NÃO são carregados automaticamente quando você busca filmes ou séries
+   - Você DEVE chamar explicitamente as funções:
+     - `FetchMovieGenres()` para gêneros de filmes
+     - `FetchTVShowGenres()` para gêneros de séries
+
+2. **Ordem Correta de Chamadas**:
+
+   ```go
+   // 1. Primeiro carrega e salva os gêneros
+   movieGenres, _ := tmdbClient.FetchMovieGenres()
+   db.SaveGenres(movieGenres)
+
+   tvGenres, _ := tmdbClient.FetchTVShowGenres()
+   db.SaveGenres(tvGenres)
+
+   // 2. Depois carrega filmes e séries
+   movies, _ := tmdbClient.DiscoverMovies(page)
+   shows, _ := tmdbClient.DiscoverTVShows(page)
+   ```
+
+3. **Por que é necessário?**
+   - Os filmes e séries vêm apenas com os IDs dos gêneros (`GenreIDs`)
+   - Os nomes dos gêneros precisam ser carregados separadamente
+   - Os gêneros raramente mudam no TMDB, então é mais eficiente carregá-los uma vez só
+   - Evita requisições desnecessárias à API
+
+4. **Relacionamentos no Banco**:
+   - Os gêneros são salvos na tabela `genres`
+   - Os relacionamentos são salvos em:
+     - `movie_genres` para filmes
+     - `tvshow_genres` para séries
+
 ## Funcionalidades
 
 - Busca filmes, séries, gêneros e trailers do TMDB

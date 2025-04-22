@@ -1,6 +1,6 @@
 {
     "tmdb": {
-        "api_key": "6c1d224bf19e450428750b415aacd325",
+        "api_key": "api_key_aqui",
         "base_url": "https://api.themoviedb.org/3",
         "image_base_url": "https://image.tmdb.org/t/p/original",
         "language": "pt-BR"
