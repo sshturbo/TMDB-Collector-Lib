@@ -1,4 +1,4 @@
-# TMDB Collector Lib
+# TMDB-Collector-Lib
 
 Esta biblioteca permite buscar filmes, séries, gêneros e trailers da API do TMDB e salvar em um banco relacional de forma eficiente.
 
@@ -75,64 +75,165 @@ CREATE TABLE tvshow_genres (
 );
 ```
 
-## Exemplo de config.json
+## Exemplos de Uso
+
+### Configuração Inicial
+
+Primeiro, crie um arquivo `config.json`:
 
 ```json
 {
-  "tmdb": {
-    "api_key": "SUA_API_KEY_AQUI",
-    "base_url": "https://api.themoviedb.org/3",
-    "image_base_url": "https://image.tmdb.org/t/p/original",
-    "language": "pt-BR"
-  },
-  "fetch": {
-    "num_pages": 1,
-    "include_adult": false,
-    "include_video": false,
-    "max_release_date": "",
-    "sort": {
-      "movies": {
-        "field": "popularity",
-        "direction": "desc"
-      },
-      "tv_shows": {
-        "field": "popularity",
-        "direction": "desc"
-      }
+    "tmdb": {
+        "api_key": "sua_api_key_aqui",
+        "base_url": "https://api.themoviedb.org/3",
+        "image_base_url": "https://image.tmdb.org/t/p/original",
+        "language": "pt-BR"
+    },
+    "database": {
+        "filename": "media.db"
+    },
+    "fetch": {
+        "num_pages": 500,
+        "include_adult": false,
+        "include_video": false,
+        "max_release_date": "",
+        "sort": {
+            "movies": {
+                "field": "popularity",
+                "direction": "desc"
+            },
+            "tv_shows": {
+                "field": "popularity",
+                "direction": "desc"
+            }
+        }
     }
-  }
 }
 ```
 
-## Exemplo de uso
+### Populando o Banco de Dados
 
-Veja o exemplo em `examples/usage.go`:
+Exemplo de como usar a biblioteca para popular seu banco de dados com filmes e séries:
 
 ```go
+package main
+
 import (
-    "database/sql"
     "encoding/json"
+    "log"
     "os"
-    _ "github.com/mattn/go-sqlite3"
-    "tmdb-collector/pkg/api"
-    "tmdb-collector/pkg/config"
-    "tmdb-collector/pkg/database"
+    
+    tmdbapi "github.com/sshturbo/TMDB-Collector-Lib/pkg/api"
+    tmdbconfig "github.com/sshturbo/TMDB-Collector-Lib/pkg/config"
+    tmdbdb "github.com/sshturbo/TMDB-Collector-Lib/pkg/database"
 )
 
 func main() {
-    // Lê a configuração de um arquivo config.json
-    f, _ := os.Open("config.json")
+    // 1. Carregar configuração
+    f, err := os.Open("config.json")
+    if err != nil {
+        log.Fatalf("Erro ao abrir config.json: %v", err)
+    }
     defer f.Close()
-    var cfg config.Config
-    json.NewDecoder(f).Decode(&cfg)
 
-    dbConn, _ := sql.Open("sqlite3", "meubanco.db")
-    db := database.NewDatabaseFromDB(dbConn)
-    tmdb := api.NewTMDBClient(&cfg)
-    movies, _ := tmdb.DiscoverMovies(1)
-    db.SaveMoviesBulk(movies)
+    var cfg tmdbconfig.Config
+    if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+        log.Fatalf("Erro ao decodificar config.json: %v", err)
+    }
+
+    // 2. Inicializar banco de dados e cliente TMDB
+    db, err := tmdbdb.NewDatabase("media.db")
+    if err != nil {
+        log.Fatalf("Erro ao conectar ao banco: %v", err)
+    }
+    
+    tmdb := tmdbapi.NewTMDBClient(&cfg)
+
+    // 3. Buscar e salvar gêneros
+    log.Println("Buscando gêneros de filmes...")
+    movieGenres, err := tmdb.FetchMovieGenres()
+    if err != nil {
+        log.Fatalf("Erro ao buscar gêneros de filmes: %v", err)
+    }
+    if err := db.SaveGenres(movieGenres); err != nil {
+        log.Fatalf("Erro ao salvar gêneros de filmes: %v", err)
+    }
+
+    log.Println("Buscando gêneros de séries...")
+    tvGenres, err := tmdb.FetchTVShowGenres()
+    if err != nil {
+        log.Fatalf("Erro ao buscar gêneros de séries: %v", err)
+    }
+    if err := db.SaveGenres(tvGenres); err != nil {
+        log.Fatalf("Erro ao salvar gêneros de séries: %v", err)
+    }
+
+    // 4. Buscar e salvar filmes
+    log.Printf("Buscando filmes (páginas: %d)...", cfg.Fetch.NumPages)
+    for page := 1; page <= cfg.Fetch.NumPages; page++ {
+        movies, err := tmdb.DiscoverMovies(page)
+        if err != nil {
+            log.Printf("Erro ao buscar filmes (página %d): %v", page, err)
+            continue
+        }
+        
+        if err := db.SaveMoviesBulk(movies); err != nil {
+            log.Printf("Erro ao salvar filmes (página %d): %v", page, err)
+            continue
+        }
+
+        // Salvar gêneros dos filmes
+        for _, movie := range movies {
+            if err := db.SaveMovieGenres(movie.ID, movie.GenreIDs); err != nil {
+                log.Printf("Erro ao salvar gêneros do filme %d: %v", movie.ID, err)
+            }
+        }
+        
+        log.Printf("Página %d: %d filmes processados", page, len(movies))
+    }
+
+    // 5. Buscar e salvar séries
+    log.Printf("Buscando séries (páginas: %d)...", cfg.Fetch.NumPages)
+    for page := 1; page <= cfg.Fetch.NumPages; page++ {
+        shows, err := tmdb.DiscoverTVShows(page)
+        if err != nil {
+            log.Printf("Erro ao buscar séries (página %d): %v", page, err)
+            continue
+        }
+        
+        if err := db.SaveTVShowsBulk(shows); err != nil {
+            log.Printf("Erro ao salvar séries (página %d): %v", page, err)
+            continue
+        }
+
+        // Salvar gêneros das séries
+        for _, show := range shows {
+            if err := db.SaveTVShowGenres(show.ID, show.GenreIDs); err != nil {
+                log.Printf("Erro ao salvar gêneros da série %d: %v", show.ID, err)
+            }
+        }
+        
+        log.Printf("Página %d: %d séries processadas", page, len(shows))
+    }
+
+    log.Println("Importação concluída!")
 }
 ```
+
+Este exemplo demonstra:
+
+- Como carregar a configuração do arquivo JSON
+- Como inicializar o cliente TMDB e o banco de dados
+- Como buscar e salvar gêneros
+- Como buscar e salvar filmes e séries com seus respectivos gêneros
+- Como usar paginação para buscar todos os itens desejados
+- Como tratar erros durante o processo
+
+**Nota**: Certifique-se de:
+
+1. Ter sua API key do TMDB configurada no `config.json`
+2. Ajustar `num_pages` de acordo com sua necessidade
+3. Configurar o campo `sort` para ordenar os resultados como desejado
 
 > **Nota:** A biblioteca só precisa da struct preenchida. O usuário pode ler de arquivo, variáveis de ambiente, etc.
 
