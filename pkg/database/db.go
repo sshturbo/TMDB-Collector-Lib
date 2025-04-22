@@ -3,7 +3,7 @@ package database
 import (
 	"database/sql"
 	"time"
-	"tmdb-collector/pkg/models"
+	"github.com/sshturbo/TMDB-Collector-Lib/pkg/models"
 
 	_ "github.com/mattn/go-sqlite3"
 )

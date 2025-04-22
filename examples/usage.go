@@ -7,9 +7,9 @@ import (
 	"log"
 	"os"
 
-	"tmdb-collector/pkg/api"
-	"tmdb-collector/pkg/config"
-	"tmdb-collector/pkg/database"
+	"github.com/sshturbo/TMDB-Collector-Lib/pkg/api"
+	"github.com/sshturbo/TMDB-Collector-Lib/pkg/config"
+	"github.com/sshturbo/TMDB-Collector-Lib/pkg/database"
 
 	_ "github.com/mattn/go-sqlite3"
 )

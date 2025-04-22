@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"tmdb-collector/pkg/config"
-	"tmdb-collector/pkg/models"
+	"github.com/sshturbo/TMDB-Collector-Lib/pkg/config"
+	"github.com/sshturbo/TMDB-Collector-Lib/pkg/models"
 )
 
 type TMDBClient struct {

@@ -1,4 +1,4 @@
-module tmdb-collector
+module github.com/sshturbo/TMDB-Collector-Lib
 
 go 1.24.2
 
