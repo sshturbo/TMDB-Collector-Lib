@@ -12,10 +12,6 @@ import (
 	"tmdb-collector/pkg/models"
 )
 
-const (
-	imageBaseURL = "https://image.tmdb.org/t/p/original"
-)
-
 type TMDBClient struct {
 	config *config.Config
 	client *http.Client
@@ -72,7 +68,6 @@ func (c *TMDBClient) SearchMovies(query string, page int) ([]models.Movie, error
 		return nil, fmt.Errorf("erro ao decodificar filmes: %v", err)
 	}
 
-	// Adiciona URL base às imagens
 	for i := range movies {
 		if movies[i].PosterPath != "" {
 			movies[i].PosterPath = c.config.TMDB.ImageBaseURL + movies[i].PosterPath
@@ -110,7 +105,6 @@ func (c *TMDBClient) SearchTVShows(query string, page int) ([]models.TVShow, err
 		return nil, fmt.Errorf("erro ao decodificar séries: %v", err)
 	}
 
-	// Adiciona URL base às imagens
 	for i := range shows {
 		if shows[i].PosterPath != "" {
 			shows[i].PosterPath = c.config.TMDB.ImageBaseURL + shows[i].PosterPath
@@ -157,9 +151,8 @@ func (c *TMDBClient) DiscoverMovies(page int) ([]models.Movie, error) {
 		return nil, fmt.Errorf("erro ao decodificar filmes: %v", err)
 	}
 
-	// Adiciona URL base às imagens e busca trailers em paralelo
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10) // Limite de 10 requisições simultâneas
+	sem := make(chan struct{}, 10)
 
 	for i := range movies {
 		if movies[i].PosterPath != "" {
@@ -219,9 +212,8 @@ func (c *TMDBClient) DiscoverTVShows(page int) ([]models.TVShow, error) {
 		return nil, fmt.Errorf("erro ao decodificar séries: %v", err)
 	}
 
-	// Adiciona URL base às imagens e busca trailers em paralelo
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10) // Limite de 10 requisições simultâneas
+	sem := make(chan struct{}, 10)
 
 	for i := range shows {
 		if shows[i].PosterPath != "" {
@@ -246,7 +238,6 @@ func (c *TMDBClient) DiscoverTVShows(page int) ([]models.TVShow, error) {
 }
 
 func (c *TMDBClient) GetMovieTrailer(movieID int) (string, error) {
-	// Função auxiliar para buscar trailer em um idioma
 	getTrailer := func(lang string) (string, error) {
 		url := fmt.Sprintf("%s/movie/%d/videos?api_key=%s&language=%s",
 			c.config.TMDB.BaseURL,
@@ -274,25 +265,24 @@ func (c *TMDBClient) GetMovieTrailer(movieID int) (string, error) {
 			return "", err
 		}
 
-		// 1. Trailer oficial
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Trailer" && video.Official {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
 			}
 		}
-		// 2. Qualquer trailer
+
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Trailer" {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
 			}
 		}
-		// 3. Teaser
+
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Teaser" {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
 			}
 		}
-		// 4. Clip
+
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Clip" {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
@@ -301,12 +291,10 @@ func (c *TMDBClient) GetMovieTrailer(movieID int) (string, error) {
 		return "", nil
 	}
 
-	// Tenta no idioma principal
 	trailer, err := getTrailer(c.config.TMDB.Language)
 	if trailer != "" {
 		return trailer, nil
 	}
-	// Se não encontrar, tenta em inglês
 	if c.config.TMDB.Language != "en-US" {
 		trailer, err = getTrailer("en-US")
 		if trailer != "" {
@@ -345,25 +333,21 @@ func (c *TMDBClient) GetTVShowTrailer(showID int) (string, error) {
 			return "", err
 		}
 
-		// 1. Trailer oficial
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Trailer" && video.Official {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
 			}
 		}
-		// 2. Qualquer trailer
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Trailer" {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
 			}
 		}
-		// 3. Teaser
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Teaser" {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
 			}
 		}
-		// 4. Clip
 		for _, video := range videos.Results {
 			if video.Site == "YouTube" && video.Type == "Clip" {
 				return fmt.Sprintf("https://www.youtube.com/watch?v=%s", video.Key), nil
