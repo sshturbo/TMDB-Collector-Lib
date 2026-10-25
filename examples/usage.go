@@ -1,64 +1,80 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/sshturbo/TMDB-Collector-Lib/pkg/api"
 	"github.com/sshturbo/TMDB-Collector-Lib/pkg/config"
 	"github.com/sshturbo/TMDB-Collector-Lib/pkg/database"
-
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/sshturbo/TMDB-Collector-Lib/pkg/models"
 )
 
 func main() {
-	// Lê a configuração de um arquivo config.json
-	f, err := os.Open("config.json")
-	if err != nil {
-		log.Fatal("Erro ao abrir config.json:", err)
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
-	defer f.Close()
+}
+
+func run() error {
+	file, err := os.Open("config.json")
+	if err != nil {
+		return fmt.Errorf("open config.json: %w", err)
+	}
+	defer file.Close()
+
 	var cfg config.Config
-	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
-		log.Fatal("Erro ao decodificar config.json:", err)
+	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
+		return fmt.Errorf("decode config.json: %w", err)
+	}
+	if key := os.Getenv("TMDB_API_KEY"); key != "" {
+		cfg.TMDB.APIKey = key
+	}
+	if cfg.TMDB.APIKey == "" {
+		return errors.New("set TMDB_API_KEY or configure tmdb.api_key")
 	}
 
-	// Inicializa o cliente TMDB
-	tmdbClient := api.NewTMDBClient(&cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	client := api.NewTMDBClient(&cfg)
 
-	// Abre o banco de dados já existente
-	dbConn, err := sql.Open("sqlite3", "meubanco.db")
+	store, err := database.NewDatabase("media.db")
 	if err != nil {
-		log.Fatal("Erro ao conectar ao banco de dados:", err)
+		return err
 	}
-	defer dbConn.Close()
+	defer store.Close()
 
-	// Usa o banco já aberto na biblioteca
-	db := database.NewDatabaseFromDB(dbConn)
-
-	// Buscar e salvar gêneros de filmes
-	movieGenres, err := tmdbClient.FetchMovieGenres()
+	genres, err := client.FetchMovieGenresContext(ctx)
 	if err != nil {
-		log.Fatalf("Erro ao buscar gêneros de filmes: %v\n", err)
+		return err
 	}
-	if err := db.SaveGenres(movieGenres); err != nil {
-		log.Fatalf("Erro ao salvar gêneros de filmes: %v\n", err)
+	if err := store.SaveGenres(genres); err != nil {
+		return err
 	}
 
-	// Buscar filmes da primeira página
-	movies, err := tmdbClient.DiscoverMovies(1)
+	movies, err := client.DiscoverMoviesContext(ctx, 1)
 	if err != nil {
-		log.Fatalf("Erro ao buscar filmes: %v\n", err)
+		return err
 	}
-	if len(movies) > 0 {
-		err := db.SaveMoviesBulk(movies)
-		if err != nil {
-			log.Printf("Erro ao salvar filmes em lote: %v\n", err)
-		} else {
-			fmt.Printf("%d filmes salvos!\n", len(movies))
+	if err := store.SaveMoviesBulk(movies); err != nil {
+		return err
+	}
+
+	relations := make([]models.MovieGenre, 0)
+	for _, movie := range movies {
+		for _, genreID := range movie.GenreIDs {
+			relations = append(relations, models.MovieGenre{MovieID: movie.ID, GenreID: genreID})
 		}
 	}
+	if err := store.SaveMovieGenresBulk(relations); err != nil {
+		return err
+	}
+
+	fmt.Printf("Saved %d movies and %d genres\n", len(movies), len(genres))
+	return nil
 }

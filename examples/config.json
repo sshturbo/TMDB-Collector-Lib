@@ -1,17 +1,20 @@
 {
     "tmdb": {
-        "api_key": "api_key_aqui",
+        "api_key": "",
         "base_url": "https://api.themoviedb.org/3",
         "image_base_url": "https://image.tmdb.org/t/p/original",
-        "language": "pt-BR"
-    },
-    "database": {
-        "filename": "media.db"
+        "language": "pt-BR",
+        "fallback_language": "en-US",
+        "timeout_seconds": 15
     },
     "fetch": {
-        "num_pages": 500,
+        "num_pages": 1,
         "include_adult": false,
         "include_video": false,
+        "fetch_trailers": false,
+        "max_concurrent_requests": 5,
+        "max_retries": 2,
+        "cache_ttl_seconds": 0,
         "max_release_date": "",
         "sort": {
             "movies": {

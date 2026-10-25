@@ -1,294 +1,197 @@
 # TMDB-Collector-Lib
 
-Esta biblioteca permite buscar filmes, séries, gêneros e trailers da API do TMDB e salvar em um banco relacional de forma eficiente.
+Cliente Go para pesquisar filmes e séries no TMDB, recuperar metadados localizados e IDs externos e persistir os resultados em SQLite. O pacote não depende de Gin, IPTVflix, IMDb comercial ou provedores de mídia.
 
-## Compatibilidade com bancos de dados
+## Requisitos
 
-Você pode usar **qualquer banco de dados suportado pelo Go (`database/sql`)**, como SQLite, PostgreSQL, MySQL, etc. Basta:
+- Go 1.24 ou superior.
+- Uma chave de API TMDB v3.
+- SQLite para usar `pkg/database`.
 
-- Instalar/importar o driver do banco desejado (exemplos abaixo)
-- Criar as tabelas com a estrutura documentada neste README (adaptando a sintaxe se necessário)
-- Passar a conexão já aberta (`*sql.DB`) para a biblioteca
+## Instalação e credenciais
 
-**Exemplos de drivers:**
-
-- SQLite: `_ "github.com/mattn/go-sqlite3"`
-- PostgreSQL: `_ "github.com/lib/pq"`
-- MySQL: `_ "github.com/go-sql-driver/mysql"`
-
-> **Atenção:** O SQL de criação das tabelas pode precisar de pequenas adaptações para cada banco (tipos, auto-incremento, etc). Veja a documentação do seu banco para detalhes.
-
-A biblioteca **não cria nem gerencia o banco**: isso é responsabilidade do usuário.
-
-## Estrutura do banco de dados
-
-**Atenção:** A biblioteca não cria as tabelas automaticamente. Você deve criar o banco e as tabelas antes de usar.
-
-Exemplo de SQL para criar as tabelas necessárias:
-
-```sql
-CREATE TABLE movies (
-    id INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    overview TEXT,
-    release_date TEXT,
-    poster_path TEXT,
-    backdrop_path TEXT,
-    vote_average REAL,
-    trailer_url TEXT,
-    popularity REAL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE tv_shows (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    overview TEXT,
-    first_air_date TEXT,
-    poster_path TEXT,
-    backdrop_path TEXT,
-    vote_average REAL,
-    trailer_url TEXT,
-    popularity REAL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE genres (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL
-);
-
-CREATE TABLE movie_genres (
-    movie_id INTEGER,
-    genre_id INTEGER,
-    PRIMARY KEY (movie_id, genre_id),
-    FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE,
-    FOREIGN KEY (genre_id) REFERENCES genres(id) ON DELETE CASCADE
-);
-
-CREATE TABLE tvshow_genres (
-    tvshow_id INTEGER,
-    genre_id INTEGER,
-    PRIMARY KEY (tvshow_id, genre_id),
-    FOREIGN KEY (tvshow_id) REFERENCES tv_shows(id) ON DELETE CASCADE,
-    FOREIGN KEY (genre_id) REFERENCES genres(id) ON DELETE CASCADE
-);
+```bash
+go get github.com/sshturbo/TMDB-Collector-Lib@v1.1.0
+export TMDB_API_KEY="sua-chave"
 ```
 
-## Exemplos de Uso
+Não salve chaves reais em `config.json`, no código-fonte ou em logs. A biblioteca recebe a chave pela configuração e remove seu valor das mensagens de erro HTTP que ela produz. Para ambientes que usam um token TMDB v4, configure um `RoundTripper` próprio que adicione o cabeçalho `Authorization: Bearer ...` e não configure `APIKey`.
 
-### Configuração Inicial
-
-Primeiro, crie um arquivo `config.json`:
-
-```json
-{
-    "tmdb": {
-        "api_key": "sua_api_key_aqui",
-        "base_url": "https://api.themoviedb.org/3",
-        "image_base_url": "https://image.tmdb.org/t/p/original",
-        "language": "pt-BR"
-    },
-    "database": {
-        "filename": "media.db"
-    },
-    "fetch": {
-        "num_pages": 500,
-        "include_adult": false,
-        "include_video": false,
-        "max_release_date": "",
-        "sort": {
-            "movies": {
-                "field": "popularity",
-                "direction": "desc"
-            },
-            "tv_shows": {
-                "field": "popularity",
-                "direction": "desc"
-            }
-        }
-    }
-}
-```
-
-### Populando o Banco de Dados
-
-Exemplo de como usar a biblioteca para popular seu banco de dados com filmes e séries:
+## Configuração e cliente HTTP
 
 ```go
-package main
+cfg := &config.Config{}
+cfg.TMDB.APIKey = os.Getenv("TMDB_API_KEY")
+cfg.TMDB.BaseURL = "https://api.themoviedb.org/3"
+cfg.TMDB.ImageBaseURL = "https://image.tmdb.org/t/p/original"
+cfg.TMDB.Language = "pt-BR"
+cfg.TMDB.FallbackLanguage = "en-US"
+cfg.TMDB.TimeoutSeconds = 15
+cfg.Fetch.MaxConcurrentRequests = 5
+cfg.Fetch.MaxRetries = 2
+cfg.Fetch.CacheTTLSeconds = 0 // cache desativado
 
-import (
-    "encoding/json"
-    "log"
-    "os"
-    
-    tmdbapi "github.com/sshturbo/TMDB-Collector-Lib/pkg/api"
-    tmdbconfig "github.com/sshturbo/TMDB-Collector-Lib/pkg/config"
-    tmdbdb "github.com/sshturbo/TMDB-Collector-Lib/pkg/database"
-)
+client := api.NewTMDBClient(cfg)
+```
 
-func main() {
-    // 1. Carregar configuração
-    f, err := os.Open("config.json")
-    if err != nil {
-        log.Fatalf("Erro ao abrir config.json: %v", err)
-    }
-    defer f.Close()
+`NewTMDBClient` preserva a assinatura anterior. Para injetar um cliente HTTP ou configurar o comportamento diretamente:
 
-    var cfg tmdbconfig.Config
-    if err := json.NewDecoder(f).Decode(&cfg); err != nil {
-        log.Fatalf("Erro ao decodificar config.json: %v", err)
-    }
+```go
+client := api.NewTMDBClientWithOptions(cfg, api.ClientOptions{
+    Timeout:               15 * time.Second,
+    MaxConcurrentRequests: 5,
+    MaxRetries:            2,
+    RetryBaseDelay:        200 * time.Millisecond,
+    CacheTTL:              30 * time.Minute,
+})
+```
 
-    // 2. Inicializar banco de dados e cliente TMDB
-    db, err := tmdbdb.NewDatabase("media.db")
-    if err != nil {
-        log.Fatalf("Erro ao conectar ao banco: %v", err)
-    }
-    
-    tmdb := tmdbapi.NewTMDBClient(&cfg)
+Os valores padrão são `pt-BR`, fallback `en-US`, timeout de 15 segundos, cinco requisições simultâneas por cliente e duas tentativas adicionais para falhas de transporte, HTTP 429 e HTTP 5xx. Use `MaxRetries: -1` para desativar retries. Respostas de sucesso podem ser armazenadas em cache com TTL (limitado a 180 dias); entradas expiradas não são retornadas e `ClearCache()` força uma nova consulta. O cache tem limite de entradas para controlar o uso de memória. Configure `CacheTTL: -1` para desativar o cache mesmo que ele esteja habilitado na configuração.
 
-    // 3. Buscar e salvar gêneros
-    log.Println("Buscando gêneros de filmes...")
-    movieGenres, err := tmdb.FetchMovieGenres()
-    if err != nil {
-        log.Fatalf("Erro ao buscar gêneros de filmes: %v", err)
-    }
-    if err := db.SaveGenres(movieGenres); err != nil {
-        log.Fatalf("Erro ao salvar gêneros de filmes: %v", err)
-    }
+As variantes `...Context` aceitam `context.Context` para timeout e cancelamento. As funções antigas continuam disponíveis e usam `context.Background()`.
 
-    log.Println("Buscando gêneros de séries...")
-    tvGenres, err := tmdb.FetchTVShowGenres()
-    if err != nil {
-        log.Fatalf("Erro ao buscar gêneros de séries: %v", err)
-    }
-    if err := db.SaveGenres(tvGenres); err != nil {
-        log.Fatalf("Erro ao salvar gêneros de séries: %v", err)
-    }
+## Pesquisa de filmes e séries
 
-    // 4. Buscar e salvar filmes
-    log.Printf("Buscando filmes (páginas: %d)...", cfg.Fetch.NumPages)
-    for page := 1; page <= cfg.Fetch.NumPages; page++ {
-        movies, err := tmdb.DiscoverMovies(page)
-        if err != nil {
-            log.Printf("Erro ao buscar filmes (página %d): %v", page, err)
-            continue
-        }
-        
-        if err := db.SaveMoviesBulk(movies); err != nil {
-            log.Printf("Erro ao salvar filmes (página %d): %v", page, err)
-            continue
-        }
+O TMDB recebe o idioma configurado em buscas e detalhes. A busca textual do TMDB considera nomes originais, traduzidos e alternativos; o parâmetro de ano é enviado quando informado. Para coletar mais de uma página, limite explicitamente o número de chamadas:
 
-        // Salvar gêneros dos filmes
-        for _, movie := range movies {
-            if err := db.SaveMovieGenres(movie.ID, movie.GenreIDs); err != nil {
-                log.Printf("Erro ao salvar gêneros do filme %d: %v", movie.ID, err)
-            }
-        }
-        
-        log.Printf("Página %d: %d filmes processados", page, len(movies))
-    }
+```go
+ctx := context.Background()
 
-    // 5. Buscar e salvar séries
-    log.Printf("Buscando séries (páginas: %d)...", cfg.Fetch.NumPages)
-    for page := 1; page <= cfg.Fetch.NumPages; page++ {
-        shows, err := tmdb.DiscoverTVShows(page)
-        if err != nil {
-            log.Printf("Erro ao buscar séries (página %d): %v", page, err)
-            continue
-        }
-        
-        if err := db.SaveTVShowsBulk(shows); err != nil {
-            log.Printf("Erro ao salvar séries (página %d): %v", page, err)
-            continue
-        }
+movies, err := client.SearchMoviePagesContext(ctx, "O Fabuloso Destino de Amélie Poulain", 2001, 3)
+if err != nil {
+    log.Fatal(err)
+}
 
-        // Salvar gêneros das séries
-        for _, show := range shows {
-            if err := db.SaveTVShowGenres(show.ID, show.GenreIDs); err != nil {
-                log.Printf("Erro ao salvar gêneros da série %d: %v", show.ID, err)
-            }
-        }
-        
-        log.Printf("Página %d: %d séries processadas", page, len(shows))
-    }
-
-    log.Println("Importação concluída!")
+shows, err := client.SearchTVShowPagesContext(ctx, "Ruptura", 2022, 2)
+if err != nil {
+    log.Fatal(err)
 }
 ```
 
-Este exemplo demonstra:
+Também permanecem disponíveis `SearchMovies(query, page)`, `SearchTVShows(query, page)`, `DiscoverMovies(page)` e `DiscoverTVShows(page)`. Para evitar dezenas de chamadas ocultas por página, descobertas não consultam trailers por padrão. Se um consumidor precisar desse comportamento, configure `cfg.Fetch.FetchTrailers = true`; as chamadas permanecem limitadas pelo semáforo compartilhado do cliente. Para um trailer pontual, use `GetMovieTrailer(id)` ou `GetTVShowTrailer(id)`.
 
-- Como carregar a configuração do arquivo JSON
-- Como inicializar o cliente TMDB e o banco de dados
-- Como buscar e salvar gêneros
-- Como buscar e salvar filmes e séries com seus respectivos gêneros
-- Como usar paginação para buscar todos os itens desejados
-- Como tratar erros durante o processo
+Para percorrer páginas de descoberta com métricas e recuperação por página, use `CollectMoviesContext(ctx, maxPages)` ou `CollectTVShowsContext`. `maxPages` limita chamadas e memória. Uma página com falha é reportada em `CollectionReport`; a coleta tenta as páginas seguintes e retorna resultados parciais junto com um erro agregado. O chamador pode persistir os itens em lote e repetir as páginas com falha depois.
 
-**Nota**: Certifique-se de:
+## Detalhes, traduções e IDs IMDb
 
-1. Ter sua API key do TMDB configurada no `config.json`
-2. Ajustar `num_pages` de acordo com sua necessidade
-3. Configurar o campo `sort` para ordenar os resultados como desejado
+```go
+movie, err := client.GetMovieDetailsContext(ctx, 361743)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(movie.Title, movie.OriginalTitle, movie.OriginalLanguage, movie.ReleaseYear, movie.IMDbID)
 
-> **Nota:** A biblioteca só precisa da struct preenchida. O usuário pode ler de arquivo, variáveis de ambiente, etc.
+ids, err := client.GetMovieExternalIDsContext(ctx, movie.ID)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(ids.IMDbID)
 
-## Como trabalhar com Gêneros (Importante)
+searchTitles, err := client.GetSearchTitlesContext(ctx, models.MediaTypeMovie, movie.ID)
+if err != nil {
+    log.Fatal(err)
+}
+for _, title := range searchTitles.SearchTitles {
+    fmt.Printf("%s (%s; %s; %s)\n", title.Title, title.Language, title.Country, title.Source)
+}
+```
 
-Para trabalhar corretamente com os gêneros de filmes e séries, é necessário seguir uma ordem específica:
+`GetMovieDetails` e `GetTVShowDetails` retornam a localização solicitada, título original, idioma original, ano, IMDb ID quando disponível e títulos alternativos/traduzidos com proveniência. Quando falta um campo localizado, o cliente tenta o fallback `en-US`, depois o título original. `GetMovieExternalIDs`, `GetTVShowExternalIDs` e `FindByIMDbID` estão disponíveis com e sem contexto. IDs externos são opcionais. O idioma dos metadados não indica o idioma das faixas de áudio ou legendas de um vídeo.
 
-1. **Carregar os Gêneros Primeiro**:
+## Identificação de conteúdo
 
-   - Os gêneros NÃO são carregados automaticamente quando você busca filmes ou séries
-   - Você DEVE chamar explicitamente as funções:
-     - `FetchMovieGenres()` para gêneros de filmes
-     - `FetchTVShowGenres()` para gêneros de séries
+```go
+result, err := client.IdentifyMediaContext(ctx, "O Poderoso Chefão", models.MediaTypeMovie, 1972)
+if err != nil {
+    log.Fatal(err)
+}
+if result.Conclusive {
+    fmt.Printf("TMDB ID: %d, confiança: %.2f\n", result.Candidate.TMDBID, result.Candidate.Confidence)
+} else {
+    fmt.Printf("Identificação ambígua; revisar %d candidatos\n", len(result.Candidates))
+}
+```
 
-2. **Ordem Correta de Chamadas**:
+A pontuação usa a maior similaridade normalizada entre o título consultado e o título localizado/original. A normalização remove acentos, converte pontuação e espaços repetidos em uma forma comparável e preserva letras e números. Com ano, o score é `0,8 × similaridade do título + 0,2 × correspondência exata do ano`; sem ano, usa apenas a similaridade. A identificação só é conclusiva acima do limiar (`0,82` com ano; `0,85` sem ano) e quando o primeiro candidato supera o segundo por pelo menos `0,08`. Resultados ambíguos são retornados para revisão e nunca selecionados automaticamente.
 
-   ```go
-   // 1. Primeiro carrega e salva os gêneros
-   movieGenres, _ := tmdbClient.FetchMovieGenres()
-   db.SaveGenres(movieGenres)
+## Banco de dados e migrações
 
-   tvGenres, _ := tmdbClient.FetchTVShowGenres()
-   db.SaveGenres(tvGenres)
+`pkg/database` oferece persistência SQLite. Os nomes e as operações SQL são específicos do SQLite; PostgreSQL e MySQL não são compatíveis nesta versão.
 
-   // 2. Depois carrega filmes e séries
-   movies, _ := tmdbClient.DiscoverMovies(page)
-   shows, _ := tmdbClient.DiscoverTVShows(page)
-   ```
+```go
+db, err := database.NewDatabase("media.db") // cria tabelas e aplica migrações
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
 
-3. **Por que é necessário?**
-   - Os filmes e séries vêm apenas com os IDs dos gêneros (`GenreIDs`)
-   - Os nomes dos gêneros precisam ser carregados separadamente
-   - Os gêneros raramente mudam no TMDB, então é mais eficiente carregá-los uma vez só
-   - Evita requisições desnecessárias à API
+if err := db.SaveMovie(&movie); err != nil {
+    log.Fatal(err)
+}
+if err := db.SaveMoviesBulk(movies); err != nil {
+    log.Fatal(err)
+}
+```
 
-4. **Relacionamentos no Banco**:
-   - Os gêneros são salvos na tabela `genres`
-   - Os relacionamentos são salvos em:
-     - `movie_genres` para filmes
-     - `tvshow_genres` para séries
+Para uma conexão já aberta, o chamador mantém a propriedade e fecha `*sql.DB`:
 
-## Funcionalidades
+```go
+dbConn, err := sql.Open("sqlite3", "media.db")
+if err != nil {
+    log.Fatal(err)
+}
+defer dbConn.Close()
 
-- Busca filmes, séries, gêneros e trailers do TMDB
-- Salva dados em lote no SQLite (ou outro banco relacional)
-- Relaciona filmes/séries com gêneros
-- Busca trailers em múltiplos idiomas e tipos
+store, err := database.NewDatabaseFromDBWithMigrations(dbConn)
+if err != nil {
+    log.Fatal(err)
+}
+```
 
-## Estrutura dos pacotes
+`NewDatabaseFromDB(*sql.DB)` continua disponível para compatibilidade e também tenta migrar; como sua assinatura histórica não retorna erro, prefira a variante `WithMigrations` para receber falhas de migração diretamente. `Migrate()` pode ser chamada novamente: é idempotente e não apaga as tabelas ou dados antigos.
 
-- `pkg/api`: Cliente TMDB
-- `pkg/database`: Operações de banco de dados
-- `pkg/models`: Modelos de dados
-- `pkg/config`: Configuração
+Ao abrir a conexão SQLite por conta própria, use o parâmetro do driver `_foreign_keys=on` na DSN se quiser que o SQLite valide as chaves estrangeiras em todas as conexões do pool.
 
-## Licença
+As tabelas guardam os campos originais/localizados, IMDb ID opcional, ano e data da última sincronização. Os títulos traduzidos e alternativos ficam em `media_titles`. O identificador TMDB continua armazenado na coluna `id` existente. Upserts usam `ON CONFLICT DO UPDATE`, preservam IDs/metadados existentes quando uma atualização parcial não os informa e não apagam relações de gêneros. `SaveMovieGenres` e `SaveTVShowGenres` atualizam o conjunto de gêneros para aquele registro; as operações em lote são transacionais. `last_synced_at` registra quando a biblioteca salvou o item, mas não é uma prova de que o TMDB mudou ou permaneceu igual. O cache reaproveita somente a mesma resposta HTTP até o TTL; para uma leitura obrigatoriamente fresca, use `ClearCache()` antes da coleta.
 
-MIT
+## Erros
+
+Erros HTTP são do tipo `*api.TMDBClientError`, com `StatusCode`, `TMDBStatusCode`, `Message` e `RetryAfter`. Use `errors.As` para inspecionar status; erros de transporte e decodificação preservam a causa com `Unwrap`. O texto de erro não inclui a chave de API nem o corpo bruto da resposta.
+
+```go
+var apiErr *api.TMDBClientError
+if errors.As(err, &apiErr) {
+    log.Printf("TMDB HTTP %d: %s", apiErr.StatusCode, apiErr.Message)
+}
+```
+
+## Atribuição e termos do TMDB
+
+O uso dos dados e imagens TMDB exige seguir os termos atuais do TMDB e atribuir a fonte na aplicação que exibe esses metadados. Os termos publicados exigem o logo TMDB e o aviso: “This [website, program, service, application, product] uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.” A aplicação deve usar um logo aprovado e não sugerir endosso. O uso comercial exige acordo escrito com TMDB; confirme os requisitos aplicáveis antes de distribuir uma aplicação.
+
+- [API Terms of Use](https://www.themoviedb.org/api-terms-of-use)
+- [TMDB FAQ: atribuição e uso da API](https://developer.themoviedb.org/docs/faq)
+- [Logos e atribuição](https://www.themoviedb.org/about/logos-attribution)
+
+Esta biblioteca é distribuída sob MIT; essa licença não substitui os termos aplicáveis aos dados, imagens, marcas ou serviços do TMDB.
+
+## Atualização do IPTVflix
+
+Nenhum arquivo do IPTVflix foi alterado. Quando a versão `v1.1.0` estiver publicada, a atualização da dependência será:
+
+```bash
+go get github.com/sshturbo/TMDB-Collector-Lib@v1.1.0
+go mod tidy
+```
+
+As assinaturas públicas existentes (`NewTMDBClient`, buscas, descobertas, gêneros, trailers, `NewDatabaseFromDB` e salvamentos em lote) foram mantidas. O IPTVflix pode migrar aos poucos para as variantes com contexto e para `NewDatabaseFromDBWithMigrations`; não precisa adaptar as chamadas atuais. A descoberta deixa de buscar trailers automaticamente por padrão para reduzir chamadas; se o IPTVflix dependia desse preenchimento, deve definir `cfg.Fetch.FetchTrailers = true` ou solicitar o trailer explicitamente para os itens necessários.
+
+## Desenvolvimento
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+Os testes HTTP usam `httptest` e não acessam o serviço real do TMDB.
