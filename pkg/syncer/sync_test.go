@@ -17,11 +17,14 @@ import (
 )
 
 func makeClient(server *httptest.Server) *api.TMDBClient {
+	return makeClientWithOptions(server, api.ClientOptions{MaxRetries: -1})
+}
+
+func makeClientWithOptions(server *httptest.Server, options api.ClientOptions) *api.TMDBClient {
 	cfg := &config.Config{}
 	cfg.TMDB.APIKey = "sync-test-key"
 	cfg.TMDB.BaseURL = server.URL + "/3"
-	cfg.Fetch.MaxRetries = -1
-	return api.NewTMDBClientWithOptions(cfg, api.ClientOptions{MaxRetries: -1})
+	return api.NewTMDBClientWithOptions(cfg, options)
 }
 
 func makeStore(t *testing.T) *database.Database {
@@ -92,7 +95,7 @@ func TestSyncFailureDoesNotAdvanceCheckpointAndCanRetry(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/3/tv/changes":
-			_, _ = fmt.Fprint(w, `{"page":1,"total_pages":1,"results":[{"id":20}]}`)
+			_, _ = fmt.Fprint(w, `{"page":1,"total_pages":1,"total_results":1,"results":[{"id":20}]}`)
 		case "/3/tv/20":
 			if fail.Load() {
 				http.Error(w, `{"status_message":"temporary failure"}`, http.StatusServiceUnavailable)
@@ -131,7 +134,7 @@ func TestSyncSplitsDateIntervalsWithOneDayOverlap(t *testing.T) {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 		intervals = append(intervals, r.URL.Query().Get("start_date")+":"+r.URL.Query().Get("end_date"))
-		_, _ = fmt.Fprint(w, `{"page":1,"total_pages":1,"results":[]}`)
+		_, _ = fmt.Fprint(w, `{"page":1,"total_pages":1,"total_results":0,"results":[]}`)
 	}))
 	defer server.Close()
 	store := makeStore(t)

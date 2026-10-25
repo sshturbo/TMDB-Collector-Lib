@@ -85,9 +85,14 @@ type cacheEntry struct {
 }
 
 type requestFlight struct {
-	done chan struct{}
-	body []byte
-	err  error
+	done      chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	waiters   int
+	complete  bool
+	abandoned bool
+	body      []byte
+	err       error
 }
 
 type TMDBClient struct {
@@ -314,6 +319,12 @@ func (c *TMDBClient) doJSONFresh(ctx context.Context, path string, query url.Val
 }
 
 func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url.Values, destination any, useCache bool) error {
+	if ctx == nil {
+		return errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	requestURL, err := c.endpoint(path, query)
 	if err != nil {
 		return err
@@ -327,35 +338,34 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 		}
 	}
 
-	for {
-		c.flightMu.Lock()
-		if flight, ok := c.flights[requestURL]; ok {
-			c.flightMu.Unlock()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-flight.done:
-				if flight.err != nil {
-					if ctx.Err() == nil && errors.Is(flight.err, context.Canceled) {
-						continue
-					}
-					return flight.err
-				}
-				if err := json.Unmarshal(flight.body, destination); err != nil {
-					return fmt.Errorf("decode TMDB response: %w", err)
-				}
-				return nil
-			}
-		}
-		flight := &requestFlight{done: make(chan struct{})}
-		c.flights[requestURL] = flight
-		c.flightMu.Unlock()
-
-		flight.body, flight.err = c.fetchJSONBody(ctx, requestURL, useCache)
-		c.flightMu.Lock()
+	c.flightMu.Lock()
+	flight, exists := c.flights[requestURL]
+	if exists && (flight.abandoned || flight.ctx.Err() != nil) {
 		delete(c.flights, requestURL)
-		close(flight.done)
-		c.flightMu.Unlock()
+		exists = false
+	}
+	leader := false
+	if !exists {
+		flightContext, cancel := context.WithCancel(context.Background())
+		flight = &requestFlight{done: make(chan struct{}), ctx: flightContext, cancel: cancel}
+		c.flights[requestURL] = flight
+		leader = true
+	}
+	flight.waiters++
+	c.flightMu.Unlock()
+	if leader {
+		go c.runRequestFlight(requestURL, flight, useCache)
+	}
+
+	select {
+	case <-ctx.Done():
+		c.releaseRequestFlight(flight)
+		return ctx.Err()
+	case <-flight.done:
+		c.releaseRequestFlight(flight)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if flight.err != nil {
 			return flight.err
 		}
@@ -364,6 +374,30 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 		}
 		return nil
 	}
+}
+
+func (c *TMDBClient) runRequestFlight(requestURL string, flight *requestFlight, useCache bool) {
+	body, err := c.fetchJSONBody(flight.ctx, requestURL, useCache)
+	c.flightMu.Lock()
+	flight.body, flight.err, flight.complete = body, err, true
+	if c.flights[requestURL] == flight {
+		delete(c.flights, requestURL)
+	}
+	close(flight.done)
+	c.flightMu.Unlock()
+	flight.cancel()
+}
+
+func (c *TMDBClient) releaseRequestFlight(flight *requestFlight) {
+	c.flightMu.Lock()
+	if flight.waiters > 0 {
+		flight.waiters--
+	}
+	if flight.waiters == 0 && !flight.complete {
+		flight.abandoned = true
+		flight.cancel()
+	}
+	c.flightMu.Unlock()
 }
 
 func (c *TMDBClient) fetchJSONBody(ctx context.Context, requestURL string, useCache bool) ([]byte, error) {
