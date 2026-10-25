@@ -70,7 +70,18 @@ if err != nil {
 
 Também permanecem disponíveis `SearchMovies(query, page)`, `SearchTVShows(query, page)`, `DiscoverMovies(page)` e `DiscoverTVShows(page)`. Para evitar dezenas de chamadas ocultas por página, descobertas não consultam trailers por padrão. Se um consumidor precisar desse comportamento, configure `cfg.Fetch.FetchTrailers = true`; as chamadas permanecem limitadas pelo semáforo compartilhado do cliente. Para um trailer pontual, use `GetMovieTrailer(id)` ou `GetTVShowTrailer(id)`.
 
-Para percorrer páginas de descoberta com métricas e recuperação por página, use `CollectMoviesContext(ctx, maxPages)` ou `CollectTVShowsContext`. `maxPages` limita chamadas e memória. Uma página com falha é reportada em `CollectionReport`; a coleta tenta as páginas seguintes e retorna resultados parciais junto com um erro agregado. O chamador pode persistir os itens em lote e repetir as páginas com falha depois.
+Para percorrer páginas de descoberta com métricas e recuperação por página, use `CollectMoviesContext(ctx, maxPages)` ou `CollectTVShowsContext`. Essas funções mantêm os resultados acumulados por compatibilidade. `maxPages` limita a coleta a até 500 páginas.
+
+Para processar lotes sem manter o catálogo inteiro em memória, use a API progressiva:
+
+```go
+report, err := client.CollectMoviesProgressiveContext(ctx, 10,
+    func(ctx context.Context, page int, batch []models.Movie) error {
+        return store.SaveMoviesBulk(batch)
+    })
+```
+
+`CollectTVShowsProgressiveContext` tem a mesma forma. O callback recebe uma página por vez; sua memória de trabalho fica limitada ao lote atual se ele não guardar os slices recebidos. Falhas de busca ficam em `report.Failures` e a coleta tenta as próximas páginas. Um erro do callback interrompe a execução. Reprocesse páginas específicas com `ProcessMoviePagesContext(ctx, pages, callback)` ou `ProcessTVShowPagesContext`; as páginas são deduplicadas e ordenadas. O relatório inclui duração, páginas solicitadas/concluídas, falhas e itens processados. Cancelamento é propagado pelo contexto e não desfaz páginas já persistidas.
 
 ## Detalhes, traduções e IDs IMDb
 
@@ -96,7 +107,7 @@ for _, title := range searchTitles.SearchTitles {
 }
 ```
 
-`GetMovieDetails` e `GetTVShowDetails` retornam a localização solicitada, título original, idioma original, ano, IMDb ID quando disponível e títulos alternativos/traduzidos com proveniência. Quando falta um campo localizado, o cliente tenta o fallback `en-US`, depois o título original. `GetMovieExternalIDs`, `GetTVShowExternalIDs` e `FindByIMDbID` estão disponíveis com e sem contexto. IDs externos são opcionais. O idioma dos metadados não indica o idioma das faixas de áudio ou legendas de um vídeo.
+`GetMovieDetails` e `GetTVShowDetails` retornam a localização solicitada, título original, idioma original, ano, IMDb ID quando disponível e títulos alternativos/traduzidos com proveniência. A deduplicação dos metadados considera título normalizado, idioma, país e origem, então duas traduções com o mesmo nome podem ser preservadas. `pt-BR` aparece primeiro, seguido do título original e dos demais títulos em ordem determinística. `UniqueSearchQueries(searchTitles.SearchTitles)` remove consultas repetidas sem alterar os metadados apresentados. Quando falta um campo localizado, o cliente tenta o fallback `en-US`, depois o título original. `GetMovieDetailsFreshContext` e `GetTVShowDetailsFreshContext` ignoram respostas em cache para fluxos que precisam buscar o estado remoto atual. IDs externos são opcionais. O idioma dos metadados não indica o idioma das faixas de áudio ou legendas de um vídeo.
 
 ## Identificação de conteúdo
 
@@ -112,7 +123,19 @@ if result.Conclusive {
 }
 ```
 
-A pontuação usa a maior similaridade normalizada entre o título consultado e o título localizado/original. A normalização remove acentos, converte pontuação e espaços repetidos em uma forma comparável e preserva letras e números. Com ano, o score é `0,8 × similaridade do título + 0,2 × correspondência exata do ano`; sem ano, usa apenas a similaridade. A identificação só é conclusiva acima do limiar (`0,82` com ano; `0,85` sem ano) e quando o primeiro candidato supera o segundo por pelo menos `0,08`. Resultados ambíguos são retornados para revisão e nunca selecionados automaticamente.
+A busca padrão verifica até três páginas e para quando o melhor candidato atinge confiança e margem suficientes. Se a pesquisa filtrada por ano não der um resultado confiável, tenta novamente sem filtro de ano. Candidatos são únicos por tipo e TMDB ID; detalhes são consultados apenas para até dois candidatos relevantes. O limite configurável é de 20 páginas e cinco consultas de detalhes. Até 50 títulos alternativos por candidato entram no cálculo; títulos e consultas são limitados a 512 pontos de código Unicode.
+
+```go
+result, err := client.IdentifyMediaWithOptionsContext(ctx, "Duna", models.MediaTypeMovie, 2021,
+    api.IdentifyMediaOptions{
+        MaxPages: 5,
+        ConfidenceThreshold: 0.9,
+        MinimumConfidenceMargin: 0.12,
+        MaxDetailLookups: 3,
+    })
+```
+
+A pontuação usa a maior similaridade normalizada entre a consulta e os títulos localizado, original e alternativo/traduzido obtidos nos detalhes. A normalização remove acentos, converte pontuação e espaços repetidos em uma forma comparável e preserva letras e números. Com ano, o score é `0,8 × similaridade do título + 0,2 × correspondência exata do ano`; sem ano, usa apenas a similaridade. Os limiares padrão são `0,82` com ano e `0,85` sem ano, com margem de `0,08`. Resultados abaixo do limiar ou ambíguos são retornados para revisão e nunca selecionados automaticamente. Detalhes são enriquecidos sob demanda; títulos alternativos que só aparecem nos detalhes podem elevar o score, mas não eliminam a necessidade de revisar empates.
 
 ## Banco de dados e migrações
 
@@ -150,13 +173,34 @@ if err != nil {
 
 `NewDatabaseFromDB(*sql.DB)` continua disponível para compatibilidade e também tenta migrar; como sua assinatura histórica não retorna erro, prefira a variante `WithMigrations` para receber falhas de migração diretamente. `Migrate()` pode ser chamada novamente: é idempotente e não apaga as tabelas ou dados antigos.
 
-Ao abrir a conexão SQLite por conta própria, use o parâmetro do driver `_foreign_keys=on` na DSN se quiser que o SQLite valide as chaves estrangeiras em todas as conexões do pool.
+Quando recebe `*sql.DB`, a biblioteca habilita `PRAGMA foreign_keys=ON` na conexão exata que executa cada migração e transação, inclusive em pools com várias conexões. A biblioteca só suporta SQL compatível com SQLite; o driver `mattn/go-sqlite3` é o único incluído e validado pelo projeto. Um teste adicional com `modernc.org/sqlite` foi adiado para não adicionar um segundo driver apenas para testes; outros drivers SQLite não têm compatibilidade automatizada garantida.
 
-As tabelas guardam os campos originais/localizados, IMDb ID opcional, ano e data da última sincronização. Os títulos traduzidos e alternativos ficam em `media_titles`. O identificador TMDB continua armazenado na coluna `id` existente. Upserts usam `ON CONFLICT DO UPDATE`, preservam IDs/metadados existentes quando uma atualização parcial não os informa e não apagam relações de gêneros. `SaveMovieGenres` e `SaveTVShowGenres` atualizam o conjunto de gêneros para aquele registro; as operações em lote são transacionais. `last_synced_at` registra quando a biblioteca salvou o item, mas não é uma prova de que o TMDB mudou ou permaneceu igual. O cache reaproveita somente a mesma resposta HTTP até o TTL; para uma leitura obrigatoriamente fresca, use `ClearCache()` antes da coleta.
+As tabelas guardam os campos originais/localizados, IMDb ID opcional, ano e data da última sincronização. O identificador TMDB continua armazenado na coluna `id` existente. Se `ID` e `TMDBID` forem preenchidos juntos, precisam corresponder; conflitos são rejeitados para evitar gravar o registro sob o ID errado. Upserts usam `ON CONFLICT DO UPDATE`, preservam IDs/metadados existentes quando uma atualização parcial não os informa, não substituem notas/popularidade por zero e não apagam relações de gêneros. Objetos retornados pelos endpoints de detalhes são marcados como completos: um zero explícito de nota ou popularidade pode atualizar um valor antigo. Detalhes completos substituem a lista de títulos alternativos em uma transação; atualizações parciais preservam títulos existentes. `SaveMovieGenres` e `SaveTVShowGenres` atualizam o conjunto de gêneros para aquele registro; as operações em lote são transacionais. `last_synced_at` registra quando a biblioteca salvou o item, mas não é uma prova de que o TMDB mudou ou permaneceu igual.
+
+## Sincronização incremental
+
+O pacote `pkg/syncer` usa os endpoints oficiais de mudanças de filmes e séries para atualizar somente os IDs retornados:
+
+```go
+report, err := syncer.SyncChangesContext(ctx, client, store, syncer.Options{
+    MediaType: models.MediaTypeMovie,
+    // StartDate omitido: retoma do checkpoint ou consulta os últimos 14 dias.
+    // EndDate omitido: usa a data atual UTC.
+    MaxPagesPerWindow: 100,
+})
+if err != nil {
+    log.Printf("sync parcial: %v (%d falhas)", err, len(report.Failures))
+}
+fmt.Printf("%d itens, %d páginas, checkpoint %s\n", report.ItemsUpdated, report.PagesProcessed, report.CompletedThrough)
+```
+
+`MediaTypeTV` sincroniza séries. Os intervalos de datas são inclusivos e limitados a 14 dias por consulta, com um dia de sobreposição entre janelas para não perder mudanças na fronteira. A paginação segue a resposta do TMDB até 500 páginas; `MaxPagesPerWindow` pode impor um limite menor. Mudanças e detalhes ignoram o cache HTTP. Os checkpoints são persistidos em `sync_checkpoints`, separados por tipo de mídia, e representam o último intervalo concluído; `last_synced_at` continua sendo apenas o horário de gravação local. Um checkpoint é avançado somente depois que todas as páginas e detalhes daquela janela forem salvos. Se houver falha, páginas anteriores podem já ter sido aplicadas, mas os upserts são idempotentes e a janela inteira será repetida com segurança. O início padrão retoma a data do checkpoint, inclusive, reconsultando a fronteira para recuperar alterações ocorridas no mesmo dia. O relatório informa IDs recebidos, duplicados ignorados, itens atualizados, páginas, janelas e falhas.
+
+O TMDB documenta endpoints de mudanças e janelas de no máximo 14 dias: [tracking de mudanças](https://developer.themoviedb.org/docs/tracking-content-changes), [filmes](https://developer.themoviedb.org/reference/changes-movie-list) e [séries](https://developer.themoviedb.org/reference/changes-tv-list). A API fornece datas, não um cursor horário; por isso a sobreposição pode reprocessar IDs na fronteira.
 
 ## Erros
 
-Erros HTTP são do tipo `*api.TMDBClientError`, com `StatusCode`, `TMDBStatusCode`, `Message` e `RetryAfter`. Use `errors.As` para inspecionar status; erros de transporte e decodificação preservam a causa com `Unwrap`. O texto de erro não inclui a chave de API nem o corpo bruto da resposta.
+Erros HTTP são do tipo `*api.TMDBClientError`, com `StatusCode`, `TMDBStatusCode`, `Message` e `RetryAfter`. Use `errors.As` para inspecionar status; erros de transporte preservam `context.Canceled` e `context.DeadlineExceeded` via `errors.Is`, sem reexpor causas brutas com URLs ou credenciais. O texto do erro não inclui a chave de API nem o corpo bruto da resposta. Requisições idênticas simultâneas compartilham a chamada em andamento; cache e respostas localizadas continuam separados pela URL completa, incluindo idioma e parâmetros. O tamanho máximo padrão da resposta é 2 MiB. `BaseURL` deve ser uma URL HTTP(S) absoluta sem credenciais embutidas; em produção, use HTTPS e trate o host configurado como confiável, pois a chave v3 é enviada como parâmetro de query. O timeout vale por tentativa HTTP; use um deadline no `context.Context` para limitar também todas as tentativas e esperas de retry.
 
 ```go
 var apiErr *api.TMDBClientError
@@ -173,7 +217,7 @@ O uso dos dados e imagens TMDB exige seguir os termos atuais do TMDB e atribuir 
 - [TMDB FAQ: atribuição e uso da API](https://developer.themoviedb.org/docs/faq)
 - [Logos e atribuição](https://www.themoviedb.org/about/logos-attribution)
 
-Esta biblioteca é distribuída sob MIT; essa licença não substitui os termos aplicáveis aos dados, imagens, marcas ou serviços do TMDB.
+Esta biblioteca é distribuída sob MIT; essa licença não substitui os termos aplicáveis aos dados, imagens, marcas ou serviços do TMDB. Temporadas e episódios ainda não fazem parte do modelo persistido; a ampliação foi adiada para manter o escopo incremental e a compatibilidade.
 
 ## Atualização do IPTVflix
 
@@ -192,6 +236,7 @@ As assinaturas públicas existentes (`NewTMDBClient`, buscas, descobertas, gêne
 go test ./...
 go test -race ./...
 go vet ./...
+go build ./...
 ```
 
 Os testes HTTP usam `httptest` e não acessam o serviço real do TMDB.

@@ -2,6 +2,8 @@ package database
 
 import (
 	"database/sql"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -169,5 +171,109 @@ func TestNewDatabaseFromDBDoesNotCloseCallerConnection(t *testing.T) {
 	}
 	if err := dbConn.Ping(); err != nil {
 		t.Fatalf("wrapper closed caller-owned DB: %v", err)
+	}
+}
+
+func TestPartialNumericUpsertsPreserveExistingValues(t *testing.T) {
+	db, err := NewDatabase(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveMovie(&models.Movie{ID: 45, Title: "Film", VoteAverage: 8.4, Popularity: 76.2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveMovie(&models.Movie{ID: 45, Title: "Search result"}); err != nil {
+		t.Fatal(err)
+	}
+	var vote float64
+	var popularity float64
+	if err := db.db.QueryRow(`SELECT vote_average, popularity FROM movies WHERE id=45`).Scan(&vote, &popularity); err != nil {
+		t.Fatal(err)
+	}
+	if vote != 8.4 || popularity != 76.2 {
+		t.Fatalf("partial update erased numeric metadata: vote=%v popularity=%v", vote, popularity)
+	}
+	if err := db.SaveMovie(&models.Movie{ID: 45, Title: "Remote full details", DetailsComplete: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRow(`SELECT vote_average, popularity FROM movies WHERE id=45`).Scan(&vote, &popularity); err != nil {
+		t.Fatal(err)
+	}
+	if vote != 0 || popularity != 0 {
+		t.Fatalf("complete details did not preserve explicit zero values: vote=%v popularity=%v", vote, popularity)
+	}
+}
+
+func TestConflictingLocalAndTMDBIDsAreRejected(t *testing.T) {
+	db, err := NewDatabase(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveMovie(&models.Movie{ID: 10, TMDBID: 11, Title: "Mismatched"}); err == nil {
+		t.Fatal("expected conflicting record identifiers to fail")
+	}
+}
+
+func TestForeignKeysEnabledOnEveryPooledConnection(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "pool.sqlite") + "?_busy_timeout=5000"
+	conn, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	const workers = 8
+	conn.SetMaxOpenConns(workers)
+	db, err := NewDatabaseFromDBWithMigrations(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ready := make(chan struct{}, workers)
+	release := make(chan struct{})
+	var group sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			tx, giveBack, err := db.beginTx()
+			if err != nil {
+				t.Errorf("begin transaction: %v", err)
+				ready <- struct{}{}
+				return
+			}
+			// Keep the transaction open to force the pool to hand out a distinct
+			// SQLite connection to each worker.
+			var enabled int
+			if err := tx.QueryRow(`PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+				t.Errorf("read foreign_keys pragma: %v", err)
+			} else if enabled != 1 {
+				t.Errorf("foreign keys disabled on pooled connection: %d", enabled)
+			}
+			ready <- struct{}{}
+			<-release
+			_ = tx.Rollback()
+			giveBack()
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		<-ready
+	}
+	close(release)
+	group.Wait()
+
+	if err := db.SaveMovie(&models.Movie{ID: 88, Title: "FK"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveMovieGenres(88, []int{999}); err == nil {
+		t.Fatal("expected invalid foreign key relation to fail")
+	}
+	var relations int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM movie_genres WHERE movie_id=88`).Scan(&relations); err != nil {
+		t.Fatal(err)
+	}
+	if relations != 0 {
+		t.Fatalf("invalid relation was persisted: %d", relations)
 	}
 }
