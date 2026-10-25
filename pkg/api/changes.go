@@ -66,9 +66,6 @@ func (c *TMDBClient) getChangedIDsContext(ctx context.Context, mediaType models.
 		return result, err
 	}
 	result.Page = response.Page
-	if result.Page == 0 {
-		result.Page = page
-	}
 	result.TotalPages = response.TotalPages
 	result.TotalResults = response.TotalResults
 	result.IDs = make([]int, 0, len(response.Results))

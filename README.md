@@ -48,7 +48,7 @@ client := api.NewTMDBClientWithOptions(cfg, api.ClientOptions{
 
 Os valores padrão são `pt-BR`, fallback `en-US`, timeout de 15 segundos, cinco requisições simultâneas por cliente e duas tentativas adicionais para falhas de transporte, HTTP 429 e HTTP 5xx. Use `MaxRetries: -1` para desativar retries. Respostas de sucesso podem ser armazenadas em cache com TTL (limitado a 180 dias); entradas expiradas não são retornadas e `ClearCache()` força uma nova consulta. O cache tem limite de entradas para controlar o uso de memória. Configure `CacheTTL: -1` para desativar o cache mesmo que ele esteja habilitado na configuração.
 
-As variantes `...Context` aceitam `context.Context` para timeout e cancelamento. As funções antigas continuam disponíveis e usam `context.Background()`.
+As variantes `...Context` aceitam `context.Context` para timeout e cancelamento. As funções antigas continuam disponíveis e usam `context.Background()`. Requisições HTTP idênticas em andamento compartilham a resposta, mas cada chamador aguarda com seu próprio contexto: cancelar um chamador não cancela os demais. O pedido compartilhado é cancelado quando todos os chamadores saem; cada tentativa HTTP continua limitada pelo timeout do cliente.
 
 ## Pesquisa de filmes e séries
 
@@ -189,12 +189,26 @@ report, err := syncer.SyncChangesContext(ctx, client, store, syncer.Options{
     MaxPagesPerWindow: 100,
 })
 if err != nil {
-    log.Printf("sync parcial: %v (%d falhas)", err, len(report.Failures))
+    log.Printf("sync parcial: %v (%d ocorrências)", err, len(report.Failures))
 }
 fmt.Printf("%d itens, %d páginas, checkpoint %s\n", report.ItemsUpdated, report.PagesProcessed, report.CompletedThrough)
 ```
 
-`MediaTypeTV` sincroniza séries. Os intervalos de datas são inclusivos e limitados a 14 dias por consulta, com um dia de sobreposição entre janelas para não perder mudanças na fronteira. A paginação segue a resposta do TMDB até 500 páginas; `MaxPagesPerWindow` pode impor um limite menor. Mudanças e detalhes ignoram o cache HTTP. Os checkpoints são persistidos em `sync_checkpoints`, separados por tipo de mídia, e representam o último intervalo concluído; `last_synced_at` continua sendo apenas o horário de gravação local. Um checkpoint é avançado somente depois que todas as páginas e detalhes daquela janela forem salvos. Se houver falha, páginas anteriores podem já ter sido aplicadas, mas os upserts são idempotentes e a janela inteira será repetida com segurança. O início padrão retoma a data do checkpoint, inclusive, reconsultando a fronteira para recuperar alterações ocorridas no mesmo dia. O relatório informa IDs recebidos, duplicados ignorados, itens atualizados, páginas, janelas e falhas.
+`MediaTypeTV` sincroniza séries. Os intervalos de datas são inclusivos e limitados a 14 dias por consulta, com um dia de sobreposição entre janelas para não perder mudanças na fronteira. A paginação valida a página retornada, `total_pages` e `total_results`; uma página vazia só conclui uma janela quando é a primeira e declara zero resultados. A biblioteca não consulta além de 500 páginas. Se `MaxPagesPerWindow` impor um limite menor que o total declarado, a janela falha sem avançar o checkpoint.
+
+Mudanças e detalhes ignoram o cache HTTP. Os checkpoints são persistidos em `sync_checkpoints`, separados por tipo de mídia, e representam o último intervalo concluído; `last_synced_at` continua sendo apenas o horário de gravação local. Um checkpoint avança depois que todas as páginas forem validadas e cada ID tiver sido atualizado ou resolvido pela política de indisponíveis. HTTP 404 em detalhes é registrado em `Report.UnavailableRecords`; por padrão, é uma falha não resolvida e impede o avanço. 429, 5xx, timeout, cancelamento e falhas de persistência também impedem o avanço e ficam em `Report.Failures`, com fase, página/ID, status HTTP e indicação de retry. Nenhum desses erros remove dados locais.
+
+Se a aplicação decidir explicitamente que um ID 404 pode ser ignorado para aquela execução, use `MissingRecordSkip`:
+
+```go
+report, err := syncer.SyncChangesContext(ctx, client, store, syncer.Options{
+    MediaType: models.MediaTypeMovie,
+    MissingRecordPolicy: syncer.MissingRecordSkip,
+})
+// Itens em report.IgnoredUnavailable foram reportados e mantidos no SQLite.
+```
+
+Esse modo permite concluir a janela, mas não agenda novas tentativas automaticamente; para reprocessar IDs ignorados, execute depois com um `StartDate` explícito que inclua a data registrada. No modo padrão, a janela incompleta é repetida após reinicialização. Páginas anteriores podem já ter sido aplicadas, mas os upserts são idempotentes. Sincronizações do mesmo tipo de mídia são serializadas dentro de uma instância de `Database`; não há coordenação entre processos diferentes ou wrappers distintos do mesmo arquivo SQLite, então execute um sincronizador por arquivo de banco. O relatório separa IDs recebidos, duplicados ignorados, itens atualizados, 404 não disponíveis/ignorados, páginas, janelas e falhas.
 
 O TMDB documenta endpoints de mudanças e janelas de no máximo 14 dias: [tracking de mudanças](https://developer.themoviedb.org/docs/tracking-content-changes), [filmes](https://developer.themoviedb.org/reference/changes-movie-list) e [séries](https://developer.themoviedb.org/reference/changes-tv-list). A API fornece datas, não um cursor horário; por isso a sobreposição pode reprocessar IDs na fronteira.
 

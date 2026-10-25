@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -326,6 +327,237 @@ func TestIdenticalConcurrentFreshRequestsShareOneInFlightCall(t *testing.T) {
 	group.Wait()
 	if calls.Load() != 1 {
 		t.Fatalf("identical in-flight requests were not shared: calls=%d", calls.Load())
+	}
+}
+
+func waitForFlightWaiters(t *testing.T, client *TMDBClient, expected int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		client.flightMu.Lock()
+		waiters := 0
+		for _, flight := range client.flights {
+			waiters = flight.waiters
+			break
+		}
+		client.flightMu.Unlock()
+		if waiters >= expected {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d shared request consumers", expected)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+func TestSharedNetworkFailureRetriesOnceForAllCallers(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			return nil, errors.New("simulated connection reset")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"result":"recovered"}`)), Request: request,
+		}, nil
+	})
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	client := testClient(server, ClientOptions{HTTPClient: &http.Client{Transport: transport, Timeout: time.Second}, MaxRetries: 1, RetryBaseDelay: time.Millisecond})
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			var result map[string]string
+			results <- client.doJSONFresh(context.Background(), "movie/5", url.Values{}, &result)
+		}()
+		if i == 0 {
+			<-started
+		}
+	}
+	waitForFlightWaiters(t, client, 2)
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("shared caller did not receive retried network response: %v", err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected one failed network attempt and one retry, got %d", calls.Load())
+	}
+}
+
+func TestCanceledLeaderDoesNotCancelValidSharedCaller(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		close(started)
+		select {
+		case <-release:
+			_, _ = w.Write([]byte(`{"result":"ok"}`))
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	client := testClient(server, ClientOptions{MaxConcurrentRequests: 1})
+	leaderContext, cancelLeader := context.WithCancel(context.Background())
+	leaderResult := make(chan error, 1)
+	go func() {
+		var result map[string]string
+		leaderResult <- client.doJSON(leaderContext, "movie/1", url.Values{}, &result)
+	}()
+	<-started
+	followerResult := make(chan error, 1)
+	go func() {
+		var result map[string]string
+		followerResult <- client.doJSON(context.Background(), "movie/1", url.Values{}, &result)
+	}()
+	waitForFlightWaiters(t, client, 2)
+	cancelLeader()
+	if err := <-leaderResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled leader did not receive its own cancellation: %v", err)
+	}
+	close(release)
+	if err := <-followerResult; err != nil {
+		t.Fatalf("valid follower inherited canceled leader error: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("shared request was unnecessarily duplicated: %d", calls.Load())
+	}
+}
+
+func TestCanceledFollowerDoesNotCancelValidLeader(t *testing.T) {
+	started, release, serverCanceled := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		close(started)
+		select {
+		case <-release:
+			_, _ = w.Write([]byte(`{"result":"ok"}`))
+		case <-r.Context().Done():
+			close(serverCanceled)
+		}
+	}))
+	defer server.Close()
+	client := testClient(server, ClientOptions{MaxConcurrentRequests: 1})
+	leaderResult := make(chan error, 1)
+	go func() {
+		var result map[string]string
+		leaderResult <- client.doJSON(context.Background(), "movie/2", url.Values{}, &result)
+	}()
+	<-started
+	followerContext, cancelFollower := context.WithCancel(context.Background())
+	followerResult := make(chan error, 1)
+	go func() {
+		var result map[string]string
+		followerResult <- client.doJSON(followerContext, "movie/2", url.Values{}, &result)
+	}()
+	waitForFlightWaiters(t, client, 2)
+	cancelFollower()
+	if err := <-followerResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled follower did not receive its own cancellation: %v", err)
+	}
+	select {
+	case <-serverCanceled:
+		t.Fatal("canceled follower canceled the shared network request")
+	default:
+	}
+	close(release)
+	if err := <-leaderResult; err != nil {
+		t.Fatalf("valid leader was canceled with its follower: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("shared request was duplicated: %d", calls.Load())
+	}
+}
+
+func TestAllSharedCallersCancelUnderlyingRequest(t *testing.T) {
+	started, serverCanceled := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		close(started)
+		<-r.Context().Done()
+		close(serverCanceled)
+	}))
+	defer server.Close()
+	client := testClient(server, ClientOptions{MaxConcurrentRequests: 1})
+	leaderContext, cancelLeader := context.WithCancel(context.Background())
+	followerContext, cancelFollower := context.WithCancel(context.Background())
+	results := make(chan error, 2)
+	for _, ctx := range []context.Context{leaderContext, followerContext} {
+		go func(ctx context.Context) {
+			var result map[string]string
+			results <- client.doJSON(ctx, "movie/3", url.Values{}, &result)
+		}(ctx)
+		if calls.Load() == 0 {
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("shared request did not start")
+			}
+		}
+	}
+	waitForFlightWaiters(t, client, 2)
+	cancelLeader()
+	cancelFollower()
+	for i := 0; i < 2; i++ {
+		if err := <-results; !errors.Is(err, context.Canceled) {
+			t.Fatalf("caller did not receive its own cancellation: %v", err)
+		}
+	}
+	select {
+	case <-serverCanceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("underlying request remained active after all callers canceled")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("unexpected network call count: %d", calls.Load())
+	}
+}
+
+func TestSharedHTTP429RetriesOnceForAllCallers(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"status_code":25,"status_message":"rate limited"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":"ok"}`))
+	}))
+	defer server.Close()
+	client := testClient(server, ClientOptions{MaxRetries: 1, RetryBaseDelay: time.Millisecond})
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			var result map[string]string
+			results <- client.doJSONFresh(context.Background(), "movie/4", url.Values{}, &result)
+		}()
+		if i == 0 {
+			<-started
+		}
+	}
+	waitForFlightWaiters(t, client, 2)
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("shared caller did not receive retried response: %v", err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected one 429 and one retry, got %d calls", calls.Load())
 	}
 }
 

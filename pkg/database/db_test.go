@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"sync"
@@ -275,5 +276,93 @@ func TestForeignKeysEnabledOnEveryPooledConnection(t *testing.T) {
 	}
 	if relations != 0 {
 		t.Fatalf("invalid relation was persisted: %d", relations)
+	}
+}
+
+func TestSyncCheckpointRefusesSilentBackwardMovement(t *testing.T) {
+	db, err := NewDatabase(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveSyncCheckpoint(SyncCheckpoint{MediaType: models.MediaTypeMovie, CompletedThrough: "2024-11-10"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveSyncCheckpoint(SyncCheckpoint{MediaType: models.MediaTypeMovie, CompletedThrough: "2024-11-09"}); err == nil {
+		t.Fatal("backward checkpoint update should return an error")
+	}
+	checkpoint, exists, err := db.GetSyncCheckpoint(models.MediaTypeMovie)
+	if err != nil || !exists || checkpoint.CompletedThrough != "2024-11-10" {
+		t.Fatalf("backward update changed checkpoint: %#v exists=%v err=%v", checkpoint, exists, err)
+	}
+}
+
+func TestAcquireSyncLockIsPerMediaAndHonorsCancellation(t *testing.T) {
+	db, err := NewDatabase(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	releaseMovie, err := db.AcquireSyncLock(context.Background(), models.MediaTypeMovie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := db.AcquireSyncLock(ctx, models.MediaTypeMovie); err == nil {
+		t.Fatal("contending media sync lock should honor the canceled context")
+	}
+	// A different media type has a separate lock and can proceed concurrently.
+	releaseTV, err := db.AcquireSyncLock(context.Background(), models.MediaTypeTV)
+	if err != nil {
+		t.Fatalf("TV sync was blocked by the movie lock: %v", err)
+	}
+	releaseTV()
+	releaseMovie()
+	if release, err := db.AcquireSyncLock(context.Background(), models.MediaTypeMovie); err != nil {
+		t.Fatal(err)
+	} else {
+		release()
+	}
+}
+
+func TestSQLiteBusyWriteRollsBackAndCanBeRetried(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "busy.sqlite")
+	store, err := NewDatabase(path + "?_busy_timeout=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SaveMovie(&models.Movie{ID: 700, Title: "Original"}); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := sql.Open("sqlite3", path+"?_busy_timeout=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	tx, err := locker.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE movies SET title='Uncommitted' WHERE id=700`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMovie(&models.Movie{ID: 700, Title: "Contending write"}); err == nil {
+		_ = tx.Rollback()
+		t.Fatal("expected SQLITE_BUSY while another connection holds a write transaction")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var title string
+	if err := store.db.QueryRow(`SELECT title FROM movies WHERE id=700`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Original" {
+		t.Fatalf("failed write partially committed: %q", title)
+	}
+	if err := store.SaveMovie(&models.Movie{ID: 700, Title: "Retried"}); err != nil {
+		t.Fatalf("write did not recover after lock release: %v", err)
 	}
 }

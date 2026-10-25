@@ -22,6 +22,8 @@ type Database struct {
 	owned        bool
 	initMu       sync.RWMutex
 	initialError error
+	syncLockMu   sync.Mutex
+	syncLocks    map[models.MediaType]chan struct{}
 }
 
 // SyncCheckpoint records the last fully processed inclusive TMDB changes date.
@@ -226,18 +228,59 @@ func (d *Database) check() error {
 	return nil
 }
 
+// AcquireSyncLock serializes incremental syncs for one media type on this
+// Database instance. Waiting respects ctx cancellation. It does not coordinate
+// separate processes or separate Database wrappers around the same SQLite file.
+func (d *Database) AcquireSyncLock(ctx context.Context, mediaType models.MediaType) (func(), error) {
+	if ctx == nil {
+		return nil, errors.New("context is required")
+	}
+	if err := validateSyncMediaType(mediaType); err != nil {
+		return nil, err
+	}
+	if err := d.check(); err != nil {
+		return nil, err
+	}
+	d.syncLockMu.Lock()
+	if d.syncLocks == nil {
+		d.syncLocks = make(map[models.MediaType]chan struct{})
+	}
+	lock := d.syncLocks[mediaType]
+	if lock == nil {
+		lock = make(chan struct{}, 1)
+		d.syncLocks[mediaType] = lock
+	}
+	d.syncLockMu.Unlock()
+
+	select {
+	case lock <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-lock
+			return nil, err
+		}
+		var once sync.Once
+		return func() { once.Do(func() { <-lock }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // beginTx enables SQLite foreign keys on the exact pooled connection that will
 // execute the transaction. A PRAGMA on *sql.DB alone only configures one connection.
 func (d *Database) beginTx() (*sql.Tx, func(), error) {
-	conn, err := d.db.Conn(context.Background())
+	return d.beginTxContext(context.Background())
+}
+
+func (d *Database) beginTxContext(ctx context.Context) (*sql.Tx, func(), error) {
+	conn, err := d.db.Conn(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("acquire SQLite connection: %w", err)
 	}
-	if _, err := conn.ExecContext(context.Background(), `PRAGMA foreign_keys = ON`); err != nil {
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("enable SQLite foreign keys: %w", err)
 	}
-	tx, err := conn.BeginTx(context.Background(), nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("begin SQLite transaction: %w", err)
@@ -494,6 +537,14 @@ func (d *Database) SaveTVShowGenresBulk(relations []models.TVShowGenre) error {
 
 // GetSyncCheckpoint returns the persisted inclusive change date for one media type.
 func (d *Database) GetSyncCheckpoint(mediaType models.MediaType) (SyncCheckpoint, bool, error) {
+	return d.GetSyncCheckpointContext(context.Background(), mediaType)
+}
+
+// GetSyncCheckpointContext is the context-aware form of GetSyncCheckpoint.
+func (d *Database) GetSyncCheckpointContext(ctx context.Context, mediaType models.MediaType) (SyncCheckpoint, bool, error) {
+	if ctx == nil {
+		return SyncCheckpoint{}, false, errors.New("context is required")
+	}
 	if err := validateSyncMediaType(mediaType); err != nil {
 		return SyncCheckpoint{}, false, err
 	}
@@ -501,7 +552,7 @@ func (d *Database) GetSyncCheckpoint(mediaType models.MediaType) (SyncCheckpoint
 		return SyncCheckpoint{}, false, err
 	}
 	checkpoint := SyncCheckpoint{MediaType: mediaType}
-	err := d.db.QueryRowContext(context.Background(), `SELECT completed_through, updated_at
+	err := d.db.QueryRowContext(ctx, `SELECT completed_through, updated_at
 		FROM sync_checkpoints WHERE media_type = ?`, mediaType).Scan(&checkpoint.CompletedThrough, &checkpoint.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SyncCheckpoint{}, false, nil
@@ -514,6 +565,14 @@ func (d *Database) GetSyncCheckpoint(mediaType models.MediaType) (SyncCheckpoint
 
 // SaveSyncCheckpoint advances a checkpoint monotonically; it never moves backward.
 func (d *Database) SaveSyncCheckpoint(checkpoint SyncCheckpoint) error {
+	return d.SaveSyncCheckpointContext(context.Background(), checkpoint)
+}
+
+// SaveSyncCheckpointContext saves an inclusive checkpoint unless ctx is canceled.
+func (d *Database) SaveSyncCheckpointContext(ctx context.Context, checkpoint SyncCheckpoint) error {
+	if ctx == nil {
+		return errors.New("context is required")
+	}
 	if err := validateSyncMediaType(checkpoint.MediaType); err != nil {
 		return err
 	}
@@ -526,20 +585,33 @@ func (d *Database) SaveSyncCheckpoint(checkpoint SyncCheckpoint) error {
 	if checkpoint.UpdatedAt.IsZero() {
 		checkpoint.UpdatedAt = time.Now().UTC()
 	}
-	tx, release, err := d.beginTx()
+	tx, release, err := d.beginTxContext(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
 	defer tx.Rollback()
-	_, err = tx.Exec(`INSERT INTO sync_checkpoints (media_type, completed_through, updated_at)
+	var current string
+	err = tx.QueryRowContext(ctx, `SELECT completed_through FROM sync_checkpoints WHERE media_type = ?`, checkpoint.MediaType).Scan(&current)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read %s sync checkpoint: %w", checkpoint.MediaType, err)
+	}
+	if current != "" && current > checkpoint.CompletedThrough {
+		return fmt.Errorf("refusing to move %s sync checkpoint backward from %s to %s", checkpoint.MediaType, current, checkpoint.CompletedThrough)
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO sync_checkpoints (media_type, completed_through, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(media_type) DO UPDATE SET
-		completed_through=CASE WHEN excluded.completed_through > sync_checkpoints.completed_through
-			THEN excluded.completed_through ELSE sync_checkpoints.completed_through END,
-		updated_at=excluded.updated_at`, checkpoint.MediaType, checkpoint.CompletedThrough, checkpoint.UpdatedAt)
+		completed_through=excluded.completed_through,
+		updated_at=excluded.updated_at
+		WHERE excluded.completed_through >= sync_checkpoints.completed_through`, checkpoint.MediaType, checkpoint.CompletedThrough, checkpoint.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("save %s sync checkpoint: %w", checkpoint.MediaType, err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("inspect %s sync checkpoint update: %w", checkpoint.MediaType, err)
+	} else if rows == 0 {
+		return fmt.Errorf("refusing to move %s sync checkpoint backward", checkpoint.MediaType)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit %s sync checkpoint: %w", checkpoint.MediaType, err)
