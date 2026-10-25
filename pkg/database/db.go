@@ -1,10 +1,12 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -18,7 +20,15 @@ var ErrDatabaseNotInitialized = errors.New("database initialization failed; call
 type Database struct {
 	db           *sql.DB
 	owned        bool
+	initMu       sync.RWMutex
 	initialError error
+}
+
+// SyncCheckpoint records the last fully processed inclusive TMDB changes date.
+type SyncCheckpoint struct {
+	MediaType        models.MediaType
+	CompletedThrough string
+	UpdatedAt        time.Time
 }
 
 func NewDatabase(dbPath string) (*Database, error) {
@@ -81,10 +91,17 @@ func (d *Database) Migrate() error {
 	if d == nil || d.db == nil {
 		return errors.New("database connection is nil")
 	}
-	if _, err := d.db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+	d.initMu.Lock()
+	defer d.initMu.Unlock()
+	conn, err := d.db.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("acquire SQLite connection for migration: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `PRAGMA foreign_keys = ON`); err != nil {
 		return fmt.Errorf("enable SQLite foreign keys: %w", err)
 	}
-	tx, err := d.db.Begin()
+	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("begin schema migration: %w", err)
 	}
@@ -120,6 +137,9 @@ func (d *Database) Migrate() error {
 			media_type TEXT NOT NULL, tmdb_id INTEGER NOT NULL, title TEXT NOT NULL,
 			language TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (media_type, tmdb_id, title, language, country, source)
+		)`,
+		`CREATE TABLE IF NOT EXISTS sync_checkpoints (
+			media_type TEXT PRIMARY KEY, completed_through TEXT NOT NULL, updated_at DATETIME NOT NULL
 		)`,
 	}
 	for _, statement := range statements {
@@ -198,10 +218,31 @@ func (d *Database) check() error {
 	if d == nil || d.db == nil {
 		return errors.New("database connection is nil")
 	}
+	d.initMu.RLock()
+	defer d.initMu.RUnlock()
 	if d.initialError != nil {
 		return fmt.Errorf("%w: %v", ErrDatabaseNotInitialized, d.initialError)
 	}
 	return nil
+}
+
+// beginTx enables SQLite foreign keys on the exact pooled connection that will
+// execute the transaction. A PRAGMA on *sql.DB alone only configures one connection.
+func (d *Database) beginTx() (*sql.Tx, func(), error) {
+	conn, err := d.db.Conn(context.Background())
+	if err != nil {
+		return nil, nil, fmt.Errorf("acquire SQLite connection: %w", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `PRAGMA foreign_keys = ON`); err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("enable SQLite foreign keys: %w", err)
+	}
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("begin SQLite transaction: %w", err)
+	}
+	return tx, func() { _ = conn.Close() }, nil
 }
 
 func (d *Database) SaveMovie(movie *models.Movie) error {
@@ -211,10 +252,11 @@ func (d *Database) SaveMovie(movie *models.Movie) error {
 	if err := d.check(); err != nil {
 		return err
 	}
-	tx, err := d.db.Begin()
+	tx, release, err := d.beginTx()
 	if err != nil {
 		return fmt.Errorf("begin save movie transaction: %w", err)
 	}
+	defer release()
 	defer tx.Rollback()
 	if err := saveMovieTx(tx, *movie); err != nil {
 		return err
@@ -223,7 +265,10 @@ func (d *Database) SaveMovie(movie *models.Movie) error {
 }
 
 func saveMovieTx(tx *sql.Tx, movie models.Movie) error {
-	id := mediaID(movie.ID, movie.TMDBID)
+	id, err := mediaID(movie.ID, movie.TMDBID)
+	if err != nil {
+		return err
+	}
 	if id <= 0 {
 		return errors.New("movie TMDB ID must be positive")
 	}
@@ -237,7 +282,7 @@ func saveMovieTx(tx *sql.Tx, movie models.Movie) error {
 	if movie.ReleaseYear == 0 {
 		movie.ReleaseYear = yearFromDate(movie.ReleaseDate)
 	}
-	_, err := tx.Exec(`INSERT INTO movies
+	_, err = tx.Exec(`INSERT INTO movies
 		(id, title, overview, release_date, poster_path, backdrop_path, vote_average, trailer_url,
 		 popularity, created_at, original_title, original_language, imdb_id, release_year, last_synced_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -247,9 +292,9 @@ func saveMovieTx(tx *sql.Tx, movie models.Movie) error {
 		 release_date=CASE WHEN excluded.release_date <> '' THEN excluded.release_date ELSE movies.release_date END,
 		 poster_path=CASE WHEN excluded.poster_path <> '' THEN excluded.poster_path ELSE movies.poster_path END,
 		 backdrop_path=CASE WHEN excluded.backdrop_path <> '' THEN excluded.backdrop_path ELSE movies.backdrop_path END,
-		 vote_average=excluded.vote_average,
+		 vote_average=CASE WHEN excluded.vote_average <> 0 OR ? = 1 THEN excluded.vote_average ELSE movies.vote_average END,
 		 trailer_url=CASE WHEN excluded.trailer_url <> '' THEN excluded.trailer_url ELSE movies.trailer_url END,
-		 popularity=excluded.popularity,
+		 popularity=CASE WHEN excluded.popularity <> 0 OR ? = 1 THEN excluded.popularity ELSE movies.popularity END,
 		 original_title=CASE WHEN excluded.original_title <> '' THEN excluded.original_title ELSE movies.original_title END,
 		 original_language=CASE WHEN excluded.original_language <> '' THEN excluded.original_language ELSE movies.original_language END,
 		 imdb_id=CASE WHEN excluded.imdb_id IS NOT NULL AND excluded.imdb_id <> '' THEN excluded.imdb_id ELSE movies.imdb_id END,
@@ -257,12 +302,12 @@ func saveMovieTx(tx *sql.Tx, movie models.Movie) error {
 		 last_synced_at=excluded.last_synced_at`,
 		id, movie.Title, movie.Overview, movie.ReleaseDate, movie.PosterPath, movie.BackdropPath,
 		movie.VoteAverage, movie.TrailerURL, movie.Popularity, movie.CreatedAt, movie.OriginalTitle,
-		movie.OriginalLanguage, nullIfEmpty(movie.IMDbID), movie.ReleaseYear, movie.LastSyncedAt)
+		movie.OriginalLanguage, nullIfEmpty(movie.IMDbID), movie.ReleaseYear, movie.LastSyncedAt, movie.DetailsComplete, movie.DetailsComplete)
 	if err != nil {
 		return fmt.Errorf("save movie %d: %w", id, err)
 	}
-	if len(movie.AlternativeTitles) > 0 {
-		if err := saveTitlesTx(tx, models.MediaTypeMovie, id, movie.AlternativeTitles); err != nil {
+	if movie.AlternativeTitlesComplete || len(movie.AlternativeTitles) > 0 {
+		if err := saveTitlesTx(tx, models.MediaTypeMovie, id, movie.AlternativeTitles, movie.AlternativeTitlesComplete); err != nil {
 			return err
 		}
 	}
@@ -276,10 +321,11 @@ func (d *Database) SaveTVShow(show *models.TVShow) error {
 	if err := d.check(); err != nil {
 		return err
 	}
-	tx, err := d.db.Begin()
+	tx, release, err := d.beginTx()
 	if err != nil {
 		return fmt.Errorf("begin save TV show transaction: %w", err)
 	}
+	defer release()
 	defer tx.Rollback()
 	if err := saveTVShowTx(tx, *show); err != nil {
 		return err
@@ -288,7 +334,10 @@ func (d *Database) SaveTVShow(show *models.TVShow) error {
 }
 
 func saveTVShowTx(tx *sql.Tx, show models.TVShow) error {
-	id := mediaID(show.ID, show.TMDBID)
+	id, err := mediaID(show.ID, show.TMDBID)
+	if err != nil {
+		return err
+	}
 	if id <= 0 {
 		return errors.New("TV show TMDB ID must be positive")
 	}
@@ -302,7 +351,7 @@ func saveTVShowTx(tx *sql.Tx, show models.TVShow) error {
 	if show.ReleaseYear == 0 {
 		show.ReleaseYear = yearFromDate(show.FirstAirDate)
 	}
-	_, err := tx.Exec(`INSERT INTO tv_shows
+	_, err = tx.Exec(`INSERT INTO tv_shows
 		(id, name, overview, first_air_date, poster_path, backdrop_path, vote_average, trailer_url,
 		 popularity, created_at, original_name, original_title, original_language, imdb_id, release_year, last_synced_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -312,9 +361,9 @@ func saveTVShowTx(tx *sql.Tx, show models.TVShow) error {
 		 first_air_date=CASE WHEN excluded.first_air_date <> '' THEN excluded.first_air_date ELSE tv_shows.first_air_date END,
 		 poster_path=CASE WHEN excluded.poster_path <> '' THEN excluded.poster_path ELSE tv_shows.poster_path END,
 		 backdrop_path=CASE WHEN excluded.backdrop_path <> '' THEN excluded.backdrop_path ELSE tv_shows.backdrop_path END,
-		 vote_average=excluded.vote_average,
+		 vote_average=CASE WHEN excluded.vote_average <> 0 OR ? = 1 THEN excluded.vote_average ELSE tv_shows.vote_average END,
 		 trailer_url=CASE WHEN excluded.trailer_url <> '' THEN excluded.trailer_url ELSE tv_shows.trailer_url END,
-		 popularity=excluded.popularity,
+		 popularity=CASE WHEN excluded.popularity <> 0 OR ? = 1 THEN excluded.popularity ELSE tv_shows.popularity END,
 		 original_name=CASE WHEN excluded.original_name <> '' THEN excluded.original_name ELSE tv_shows.original_name END,
 		 original_title=CASE WHEN excluded.original_title <> '' THEN excluded.original_title ELSE tv_shows.original_title END,
 		 original_language=CASE WHEN excluded.original_language <> '' THEN excluded.original_language ELSE tv_shows.original_language END,
@@ -323,12 +372,12 @@ func saveTVShowTx(tx *sql.Tx, show models.TVShow) error {
 		 last_synced_at=excluded.last_synced_at`,
 		id, show.Name, show.Overview, show.FirstAirDate, show.PosterPath, show.BackdropPath,
 		show.VoteAverage, show.TrailerURL, show.Popularity, show.CreatedAt, show.OriginalName,
-		show.OriginalTitle, show.OriginalLanguage, nullIfEmpty(show.IMDbID), show.ReleaseYear, show.LastSyncedAt)
+		show.OriginalTitle, show.OriginalLanguage, nullIfEmpty(show.IMDbID), show.ReleaseYear, show.LastSyncedAt, show.DetailsComplete, show.DetailsComplete)
 	if err != nil {
 		return fmt.Errorf("save TV show %d: %w", id, err)
 	}
-	if len(show.AlternativeTitles) > 0 {
-		if err := saveTitlesTx(tx, models.MediaTypeTV, id, show.AlternativeTitles); err != nil {
+	if show.AlternativeTitlesComplete || len(show.AlternativeTitles) > 0 {
+		if err := saveTitlesTx(tx, models.MediaTypeTV, id, show.AlternativeTitles, show.AlternativeTitlesComplete); err != nil {
 			return err
 		}
 	}
@@ -350,10 +399,11 @@ func (d *Database) SaveTVShowsBulk(shows []models.TVShow) error {
 }
 
 func (d *Database) saveBulk(count int, save func(*sql.Tx, int) error) error {
-	tx, err := d.db.Begin()
+	tx, release, err := d.beginTx()
 	if err != nil {
 		return fmt.Errorf("begin bulk save transaction: %w", err)
 	}
+	defer release()
 	defer tx.Rollback()
 	for index := 0; index < count; index++ {
 		if err := save(tx, index); err != nil {
@@ -370,10 +420,11 @@ func (d *Database) SaveGenres(genres []models.Genre) error {
 	if err := d.check(); err != nil {
 		return err
 	}
-	tx, err := d.db.Begin()
+	tx, release, err := d.beginTx()
 	if err != nil {
 		return fmt.Errorf("begin save genres transaction: %w", err)
 	}
+	defer release()
 	defer tx.Rollback()
 	stmt, err := tx.Prepare(`INSERT INTO genres (id, name) VALUES (?, ?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name`)
@@ -401,10 +452,11 @@ func (d *Database) saveRelations(table, mediaColumn string, mediaID int, genreID
 	if err := d.check(); err != nil {
 		return err
 	}
-	tx, err := d.db.Begin()
+	tx, release, err := d.beginTx()
 	if err != nil {
 		return fmt.Errorf("begin save media genres transaction: %w", err)
 	}
+	defer release()
 	defer tx.Rollback()
 	if _, err := tx.Exec("DELETE FROM "+table+" WHERE "+mediaColumn+" = ?", mediaID); err != nil {
 		return fmt.Errorf("replace %s relations for %d: %w", table, mediaID, err)
@@ -440,11 +492,74 @@ func (d *Database) SaveTVShowGenresBulk(relations []models.TVShowGenre) error {
 	})
 }
 
+// GetSyncCheckpoint returns the persisted inclusive change date for one media type.
+func (d *Database) GetSyncCheckpoint(mediaType models.MediaType) (SyncCheckpoint, bool, error) {
+	if err := validateSyncMediaType(mediaType); err != nil {
+		return SyncCheckpoint{}, false, err
+	}
+	if err := d.check(); err != nil {
+		return SyncCheckpoint{}, false, err
+	}
+	checkpoint := SyncCheckpoint{MediaType: mediaType}
+	err := d.db.QueryRowContext(context.Background(), `SELECT completed_through, updated_at
+		FROM sync_checkpoints WHERE media_type = ?`, mediaType).Scan(&checkpoint.CompletedThrough, &checkpoint.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SyncCheckpoint{}, false, nil
+	}
+	if err != nil {
+		return SyncCheckpoint{}, false, fmt.Errorf("load %s sync checkpoint: %w", mediaType, err)
+	}
+	return checkpoint, true, nil
+}
+
+// SaveSyncCheckpoint advances a checkpoint monotonically; it never moves backward.
+func (d *Database) SaveSyncCheckpoint(checkpoint SyncCheckpoint) error {
+	if err := validateSyncMediaType(checkpoint.MediaType); err != nil {
+		return err
+	}
+	if _, err := time.Parse("2006-01-02", checkpoint.CompletedThrough); err != nil {
+		return fmt.Errorf("invalid checkpoint date %q: %w", checkpoint.CompletedThrough, err)
+	}
+	if err := d.check(); err != nil {
+		return err
+	}
+	if checkpoint.UpdatedAt.IsZero() {
+		checkpoint.UpdatedAt = time.Now().UTC()
+	}
+	tx, release, err := d.beginTx()
+	if err != nil {
+		return err
+	}
+	defer release()
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO sync_checkpoints (media_type, completed_through, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(media_type) DO UPDATE SET
+		completed_through=CASE WHEN excluded.completed_through > sync_checkpoints.completed_through
+			THEN excluded.completed_through ELSE sync_checkpoints.completed_through END,
+		updated_at=excluded.updated_at`, checkpoint.MediaType, checkpoint.CompletedThrough, checkpoint.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("save %s sync checkpoint: %w", checkpoint.MediaType, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s sync checkpoint: %w", checkpoint.MediaType, err)
+	}
+	return nil
+}
+
+func validateSyncMediaType(mediaType models.MediaType) error {
+	if mediaType != models.MediaTypeMovie && mediaType != models.MediaTypeTV {
+		return fmt.Errorf("unsupported sync media type %q", mediaType)
+	}
+	return nil
+}
+
 func (d *Database) saveRelationBulk(table, mediaColumn string, count int, at func(int) (int, int)) error {
-	tx, err := d.db.Begin()
+	tx, release, err := d.beginTx()
 	if err != nil {
 		return fmt.Errorf("begin bulk relationship transaction: %w", err)
 	}
+	defer release()
 	defer tx.Rollback()
 	stmt, err := tx.Prepare("INSERT OR IGNORE INTO " + table + " (" + mediaColumn + ", genre_id) VALUES (?, ?)")
 	if err != nil {
@@ -460,9 +575,11 @@ func (d *Database) saveRelationBulk(table, mediaColumn string, count int, at fun
 	return tx.Commit()
 }
 
-func saveTitlesTx(tx *sql.Tx, mediaType models.MediaType, tmdbID int, titles []models.LocalizedTitle) error {
-	if _, err := tx.Exec(`DELETE FROM media_titles WHERE media_type = ? AND tmdb_id = ?`, mediaType, tmdbID); err != nil {
-		return fmt.Errorf("replace titles for %s %d: %w", mediaType, tmdbID, err)
+func saveTitlesTx(tx *sql.Tx, mediaType models.MediaType, tmdbID int, titles []models.LocalizedTitle, replace bool) error {
+	if replace {
+		if _, err := tx.Exec(`DELETE FROM media_titles WHERE media_type = ? AND tmdb_id = ?`, mediaType, tmdbID); err != nil {
+			return fmt.Errorf("replace titles for %s %d: %w", mediaType, tmdbID, err)
+		}
 	}
 	stmt, err := tx.Prepare(`INSERT INTO media_titles
 		(media_type, tmdb_id, title, language, country, source) VALUES (?, ?, ?, ?, ?, ?)
@@ -482,11 +599,14 @@ func saveTitlesTx(tx *sql.Tx, mediaType models.MediaType, tmdbID int, titles []m
 	return nil
 }
 
-func mediaID(id, tmdbID int) int {
-	if id == 0 {
-		return tmdbID
+func mediaID(id, tmdbID int) (int, error) {
+	if id != 0 && tmdbID != 0 && id != tmdbID {
+		return 0, fmt.Errorf("ID %d conflicts with TMDBID %d", id, tmdbID)
 	}
-	return id
+	if id == 0 {
+		return tmdbID, nil
+	}
+	return id, nil
 }
 
 func nullIfEmpty(value string) any {

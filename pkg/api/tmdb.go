@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sshturbo/TMDB-Collector-Lib/internal/normalization"
 	"github.com/sshturbo/TMDB-Collector-Lib/pkg/config"
@@ -20,16 +22,21 @@ import (
 )
 
 const (
-	defaultBaseURL      = "https://api.themoviedb.org/3"
-	defaultImageBaseURL = "https://image.tmdb.org/t/p/original"
-	defaultLanguage     = "pt-BR"
-	defaultFallback     = "en-US"
-	defaultTimeout      = 15 * time.Second
-	defaultConcurrency  = 5
-	defaultRetries      = 2
-	defaultResponseSize = 2 << 20
-	defaultCacheEntries = 512
-	maxCacheTTL         = 180 * 24 * time.Hour
+	defaultBaseURL           = "https://api.themoviedb.org/3"
+	defaultImageBaseURL      = "https://image.tmdb.org/t/p/original"
+	defaultLanguage          = "pt-BR"
+	defaultFallback          = "en-US"
+	defaultTimeout           = 15 * time.Second
+	defaultConcurrency       = 5
+	defaultRetries           = 2
+	defaultResponseSize      = 2 << 20
+	defaultCacheEntries      = 512
+	maxSearchTitleRunes      = 512
+	maxSearchPages           = 500
+	maxIdentificationAliases = 50
+	maxCacheTTL              = 180 * 24 * time.Hour
+	maxIdentifyPages         = 20
+	maxDetailLookups         = 5
 )
 
 // ClientOptions configures HTTP behavior. Zero values use conservative defaults;
@@ -77,6 +84,12 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
+type requestFlight struct {
+	done chan struct{}
+	body []byte
+	err  error
+}
+
 type TMDBClient struct {
 	config           *config.Config
 	client           *http.Client
@@ -94,6 +107,8 @@ type TMDBClient struct {
 	semaphore        chan struct{}
 	cacheMu          sync.Mutex
 	cache            map[string]cacheEntry
+	flightMu         sync.Mutex
+	flights          map[string]*requestFlight
 }
 
 type TMDBResponse struct {
@@ -110,6 +125,34 @@ type VideoResponse struct {
 		Type     string `json:"type"`
 		Official bool   `json:"official"`
 	} `json:"results"`
+}
+
+// IdentifyMediaOptions tunes the bounded search and confidence policy used by
+// IdentifyMediaWithOptionsContext. Zero values preserve the library defaults.
+type IdentifyMediaOptions struct {
+	MaxPages                int
+	ConfidenceThreshold     float64
+	MinimumConfidenceMargin float64
+	MaxDetailLookups        int
+	DisableYearFallback     bool
+}
+
+const (
+	defaultIdentifyPages = 3
+	defaultDetailLookups = 2
+)
+
+func validateSearchTitle(title string) error {
+	if len(title) > maxSearchTitleRunes*utf8.UTFMax || utf8.RuneCountInString(title) > maxSearchTitleRunes {
+		return fmt.Errorf("title exceeds the %d-rune search limit", maxSearchTitleRunes)
+	}
+	if !utf8.ValidString(title) {
+		return errors.New("title must be valid UTF-8")
+	}
+	if normalization.Title(title) == "" {
+		return errors.New("title must not be empty")
+	}
+	return nil
 }
 
 // NewTMDBClient preserves the original constructor and uses safe defaults.
@@ -210,7 +253,7 @@ func NewTMDBClientWithOptions(cfg *config.Config, options ClientOptions) *TMDBCl
 		includeTrailers: cfg.Fetch.FetchTrailers, maxRetries: maxRetries,
 		retryBaseDelay: retryBaseDelay, maxResponseBytes: maxResponseBytes, cacheTTL: cacheTTL,
 		maxCacheEntries: maxCacheEntries,
-		semaphore:       make(chan struct{}, maxConcurrent), cache: make(map[string]cacheEntry),
+		semaphore:       make(chan struct{}, maxConcurrent), cache: make(map[string]cacheEntry), flights: make(map[string]*requestFlight),
 	}
 }
 
@@ -233,7 +276,14 @@ func (c *TMDBClient) ClearCache() {
 }
 
 func (c *TMDBClient) endpoint(path string, query url.Values) (string, error) {
-	base, err := url.Parse(c.baseURL + "/")
+	parsedBase, err := url.Parse(c.baseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid TMDB base URL: %w", err)
+	}
+	if (parsedBase.Scheme != "http" && parsedBase.Scheme != "https") || parsedBase.Host == "" || parsedBase.User != nil || parsedBase.RawQuery != "" || parsedBase.Fragment != "" {
+		return "", errors.New("TMDB base URL must be an absolute HTTP(S) URL without embedded credentials")
+	}
+	base, err := url.Parse(strings.TrimRight(c.baseURL, "/") + "/")
 	if err != nil {
 		return "", fmt.Errorf("invalid TMDB base URL: %w", err)
 	}
@@ -277,10 +327,50 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 		}
 	}
 
+	for {
+		c.flightMu.Lock()
+		if flight, ok := c.flights[requestURL]; ok {
+			c.flightMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-flight.done:
+				if flight.err != nil {
+					if ctx.Err() == nil && errors.Is(flight.err, context.Canceled) {
+						continue
+					}
+					return flight.err
+				}
+				if err := json.Unmarshal(flight.body, destination); err != nil {
+					return fmt.Errorf("decode TMDB response: %w", err)
+				}
+				return nil
+			}
+		}
+		flight := &requestFlight{done: make(chan struct{})}
+		c.flights[requestURL] = flight
+		c.flightMu.Unlock()
+
+		flight.body, flight.err = c.fetchJSONBody(ctx, requestURL, useCache)
+		c.flightMu.Lock()
+		delete(c.flights, requestURL)
+		close(flight.done)
+		c.flightMu.Unlock()
+		if flight.err != nil {
+			return flight.err
+		}
+		if err := json.Unmarshal(flight.body, destination); err != nil {
+			return fmt.Errorf("decode TMDB response: %w", err)
+		}
+		return nil
+	}
+}
+
+func (c *TMDBClient) fetchJSONBody(ctx context.Context, requestURL string, useCache bool) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		requestContext := ctx
 		cancel := func() {}
@@ -290,7 +380,7 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 		request, err := http.NewRequestWithContext(requestContext, http.MethodGet, requestURL, nil)
 		if err != nil {
 			cancel()
-			return fmt.Errorf("create TMDB request: %w", err)
+			return nil, fmt.Errorf("create TMDB request: %w", err)
 		}
 		request.Header.Set("Accept", "application/json")
 
@@ -298,7 +388,7 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 		case c.semaphore <- struct{}{}:
 		case <-requestContext.Done():
 			cancel()
-			return requestContext.Err()
+			return nil, requestContext.Err()
 		}
 		response, requestErr := c.client.Do(request)
 		if requestErr != nil {
@@ -307,11 +397,11 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 			lastErr = safeRequestError(requestErr, c.apiKey)
 			if attempt < c.maxRetries && ctx.Err() == nil {
 				if err := waitContext(ctx, c.retryDelay(attempt, 0)); err != nil {
-					return err
+					return nil, err
 				}
 				continue
 			}
-			return &TMDBClientError{Message: lastErr.Error(), cause: lastErr}
+			return nil, &TMDBClientError{Message: lastErr.Error(), cause: lastErr}
 		}
 
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
@@ -322,14 +412,14 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 			lastErr = fmt.Errorf("read TMDB response: %w", readErr)
 			if attempt < c.maxRetries && ctx.Err() == nil {
 				if err := waitContext(ctx, c.retryDelay(attempt, 0)); err != nil {
-					return err
+					return nil, err
 				}
 				continue
 			}
-			return &TMDBClientError{Message: lastErr.Error(), cause: lastErr}
+			return nil, &TMDBClientError{Message: lastErr.Error(), cause: lastErr}
 		}
 		if int64(len(body)) > c.maxResponseBytes {
-			return &TMDBClientError{Message: "TMDB response exceeded configured size limit"}
+			return nil, &TMDBClientError{Message: "TMDB response exceeded configured size limit"}
 		}
 
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
@@ -337,21 +427,18 @@ func (c *TMDBClient) doJSONWithCache(ctx context.Context, path string, query url
 			lastErr = apiErr
 			if isTransientStatus(response.StatusCode) && attempt < c.maxRetries {
 				if err := waitContext(ctx, c.retryDelay(attempt, apiErr.RetryAfter)); err != nil {
-					return err
+					return nil, err
 				}
 				continue
 			}
-			return apiErr
+			return nil, apiErr
 		}
 		if useCache && c.cacheTTL > 0 {
 			c.storeCache(requestURL, body)
 		}
-		if err := json.Unmarshal(body, destination); err != nil {
-			return fmt.Errorf("decode TMDB response: %w", err)
-		}
-		return nil
+		return body, nil
 	}
-	return lastErr
+	return nil, lastErr
 }
 
 func safeRequestError(err error, apiKey string) error {
@@ -362,14 +449,31 @@ func safeRequestError(err error, apiKey string) error {
 			query := parsed.Query()
 			query.Set("api_key", "[REDACTED]")
 			parsed.RawQuery = query.Encode()
-			return &url.Error{Op: urlErr.Op, URL: parsed.String(), Err: urlErr.Err}
+			return &url.Error{Op: urlErr.Op, URL: parsed.String(), Err: safeCauseFor(urlErr.Err, apiKey)}
 		}
 	}
 	message := err.Error()
 	if apiKey != "" {
 		message = strings.ReplaceAll(message, apiKey, "[REDACTED]")
+		message = strings.ReplaceAll(message, url.QueryEscape(apiKey), "[REDACTED]")
 	}
-	return &safeCause{message: message, cause: err}
+	return &safeCause{message: message, cause: safeCauseFor(err, apiKey).cause}
+}
+
+func safeCauseFor(err error, apiKey string) *safeCause {
+	message := err.Error()
+	if apiKey != "" {
+		message = strings.ReplaceAll(message, apiKey, "[REDACTED]")
+		message = strings.ReplaceAll(message, url.QueryEscape(apiKey), "[REDACTED]")
+	}
+	var safe error
+	switch {
+	case errors.Is(err, context.Canceled):
+		safe = context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		safe = context.DeadlineExceeded
+	}
+	return &safeCause{message: message, cause: safe}
 }
 
 type safeCause struct {
@@ -389,6 +493,7 @@ func parseAPIError(status int, headers http.Header, body []byte, apiKey string) 
 	message := strings.TrimSpace(payload.StatusMessage)
 	if apiKey != "" {
 		message = strings.ReplaceAll(message, apiKey, "[REDACTED]")
+		message = strings.ReplaceAll(message, url.QueryEscape(apiKey), "[REDACTED]")
 	}
 	return &TMDBClientError{
 		StatusCode: status, TMDBStatusCode: payload.StatusCode,
@@ -493,6 +598,17 @@ func (c *TMDBClient) SearchMoviesContext(ctx context.Context, query string, page
 
 // SearchMoviesByTitleContext adds the official primary_release_year search filter when year is non-zero.
 func (c *TMDBClient) SearchMoviesByTitleContext(ctx context.Context, title string, year, page int) ([]models.Movie, error) {
+	movies, _, err := c.searchMoviesByTitlePageContext(ctx, title, year, page)
+	return movies, err
+}
+
+func (c *TMDBClient) searchMoviesByTitlePageContext(ctx context.Context, title string, year, page int) ([]models.Movie, int, error) {
+	if err := validateSearchTitle(title); err != nil {
+		return nil, 0, err
+	}
+	if page > maxSearchPages {
+		return nil, 0, fmt.Errorf("page cannot exceed TMDB's %d-page limit", maxSearchPages)
+	}
 	if page < 1 {
 		page = 1
 	}
@@ -509,7 +625,7 @@ func (c *TMDBClient) SearchMoviesByTitleContext(ctx context.Context, title strin
 		TotalResults int            `json:"total_results"`
 	}
 	if err := c.doJSON(ctx, "search/movie", params, &response); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for i := range response.Results {
 		prepareMovie(&response.Results[i], c.imageBaseURL)
@@ -517,7 +633,7 @@ func (c *TMDBClient) SearchMoviesByTitleContext(ctx context.Context, title strin
 	if response.Results == nil {
 		response.Results = []models.Movie{}
 	}
-	return response.Results, nil
+	return response.Results, response.TotalPages, nil
 }
 
 // SearchMoviePagesContext collects consecutive pages up to maxPages and stops early
@@ -526,6 +642,9 @@ func (c *TMDBClient) SearchMoviePagesContext(ctx context.Context, title string, 
 	results := make([]models.Movie, 0)
 	if maxPages < 0 {
 		return results, errors.New("maxPages must not be negative")
+	}
+	if maxPages > maxSearchPages {
+		return results, fmt.Errorf("maxPages cannot exceed %d", maxSearchPages)
 	}
 	for page := 1; page <= maxPages; page++ {
 		movies, err := c.SearchMoviesByTitleContext(ctx, title, year, page)
@@ -550,6 +669,17 @@ func (c *TMDBClient) SearchTVShowsContext(ctx context.Context, query string, pag
 }
 
 func (c *TMDBClient) SearchTVShowsByTitleContext(ctx context.Context, title string, year, page int) ([]models.TVShow, error) {
+	shows, _, err := c.searchTVShowsByTitlePageContext(ctx, title, year, page)
+	return shows, err
+}
+
+func (c *TMDBClient) searchTVShowsByTitlePageContext(ctx context.Context, title string, year, page int) ([]models.TVShow, int, error) {
+	if err := validateSearchTitle(title); err != nil {
+		return nil, 0, err
+	}
+	if page > maxSearchPages {
+		return nil, 0, fmt.Errorf("page cannot exceed TMDB's %d-page limit", maxSearchPages)
+	}
 	if page < 1 {
 		page = 1
 	}
@@ -566,7 +696,7 @@ func (c *TMDBClient) SearchTVShowsByTitleContext(ctx context.Context, title stri
 		TotalResults int             `json:"total_results"`
 	}
 	if err := c.doJSON(ctx, "search/tv", params, &response); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for i := range response.Results {
 		prepareTVShow(&response.Results[i], c.imageBaseURL)
@@ -574,7 +704,7 @@ func (c *TMDBClient) SearchTVShowsByTitleContext(ctx context.Context, title stri
 	if response.Results == nil {
 		response.Results = []models.TVShow{}
 	}
-	return response.Results, nil
+	return response.Results, response.TotalPages, nil
 }
 
 // SearchTVShowPagesContext collects consecutive pages up to maxPages.
@@ -582,6 +712,9 @@ func (c *TMDBClient) SearchTVShowPagesContext(ctx context.Context, title string,
 	results := make([]models.TVShow, 0)
 	if maxPages < 0 {
 		return results, errors.New("maxPages must not be negative")
+	}
+	if maxPages > maxSearchPages {
+		return results, fmt.Errorf("maxPages cannot exceed %d", maxSearchPages)
 	}
 	for page := 1; page <= maxPages; page++ {
 		shows, err := c.SearchTVShowsByTitleContext(ctx, title, year, page)
@@ -849,8 +982,23 @@ func (c *TMDBClient) GetMovieDetails(movieID int) (models.Movie, error) {
 }
 
 func (c *TMDBClient) GetMovieDetailsContext(ctx context.Context, movieID int) (models.Movie, error) {
+	return c.getMovieDetailsContext(ctx, movieID, false)
+}
+
+// GetMovieDetailsFreshContext bypasses the response cache for synchronization workflows.
+func (c *TMDBClient) GetMovieDetailsFreshContext(ctx context.Context, movieID int) (models.Movie, error) {
+	return c.getMovieDetailsContext(ctx, movieID, true)
+}
+
+func (c *TMDBClient) getMovieDetailsContext(ctx context.Context, movieID int, fresh bool) (models.Movie, error) {
 	var payload movieDetailsPayload
-	if err := c.doJSON(ctx, fmt.Sprintf("movie/%d", movieID), detailQuery(c.language), &payload); err != nil {
+	var err error
+	if fresh {
+		err = c.doJSONFresh(ctx, fmt.Sprintf("movie/%d", movieID), detailQuery(c.language), &payload)
+	} else {
+		err = c.doJSON(ctx, fmt.Sprintf("movie/%d", movieID), detailQuery(c.language), &payload)
+	}
+	if err != nil {
 		return models.Movie{}, err
 	}
 	movie := payload.Movie
@@ -858,6 +1006,8 @@ func (c *TMDBClient) GetMovieDetailsContext(ctx context.Context, movieID int) (m
 	movie.TMDBID = movie.ID
 	movie.IMDbID = payload.ExternalIDs.IMDbID
 	movie.AlternativeTitles = movieAlternativeTitles(payload.AlternativeNames)
+	movie.AlternativeTitlesComplete = true
+	movie.DetailsComplete = true
 	localizedTitle, localizedOverview := "", ""
 	fallbackTitle, fallbackOverview := "", ""
 	for _, translated := range payload.Translations.Translations {
@@ -899,8 +1049,23 @@ func (c *TMDBClient) GetTVShowDetails(tvID int) (models.TVShow, error) {
 }
 
 func (c *TMDBClient) GetTVShowDetailsContext(ctx context.Context, tvID int) (models.TVShow, error) {
+	return c.getTVShowDetailsContext(ctx, tvID, false)
+}
+
+// GetTVShowDetailsFreshContext bypasses the response cache for synchronization workflows.
+func (c *TMDBClient) GetTVShowDetailsFreshContext(ctx context.Context, tvID int) (models.TVShow, error) {
+	return c.getTVShowDetailsContext(ctx, tvID, true)
+}
+
+func (c *TMDBClient) getTVShowDetailsContext(ctx context.Context, tvID int, fresh bool) (models.TVShow, error) {
 	var payload tvDetailsPayload
-	if err := c.doJSON(ctx, fmt.Sprintf("tv/%d", tvID), detailQuery(c.language), &payload); err != nil {
+	var err error
+	if fresh {
+		err = c.doJSONFresh(ctx, fmt.Sprintf("tv/%d", tvID), detailQuery(c.language), &payload)
+	} else {
+		err = c.doJSON(ctx, fmt.Sprintf("tv/%d", tvID), detailQuery(c.language), &payload)
+	}
+	if err != nil {
 		return models.TVShow{}, err
 	}
 	show := payload.TVShow
@@ -908,6 +1073,8 @@ func (c *TMDBClient) GetTVShowDetailsContext(ctx context.Context, tvID int) (mod
 	show.TMDBID = show.ID
 	show.IMDbID = payload.ExternalIDs.IMDbID
 	show.AlternativeTitles = tvAlternativeTitles(payload.AlternativeNames)
+	show.AlternativeTitlesComplete = true
+	show.DetailsComplete = true
 	localizedTitle, localizedOverview := "", ""
 	fallbackTitle, fallbackOverview := "", ""
 	for _, translated := range payload.Translations.Translations {
@@ -1058,10 +1225,11 @@ func titleSet(current, currentLanguage, original, originalLanguage string, alter
 	seen := make(map[string]bool)
 	add := func(title, language, source, country string) {
 		normalized := normalization.Title(title)
-		if normalized == "" || seen[normalized] {
+		metadataKey := strings.Join([]string{normalized, strings.ToLower(language), strings.ToLower(country), strings.ToLower(source)}, "\x00")
+		if normalized == "" || seen[metadataKey] {
 			return
 		}
-		seen[normalized] = true
+		seen[metadataKey] = true
 		result = append(result, models.LocalizedTitle{Title: strings.TrimSpace(title), Language: language, Source: source, Country: country})
 	}
 	add(current, currentLanguage, "localized", "")
@@ -1069,7 +1237,56 @@ func titleSet(current, currentLanguage, original, originalLanguage string, alter
 	for _, title := range alternatives {
 		add(title.Title, title.Language, title.Source, title.Country)
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		rank := func(title models.LocalizedTitle) int {
+			if strings.EqualFold(title.Language, currentLanguage) && title.Country == "" {
+				return 0
+			}
+			if strings.EqualFold(title.Source, "original") {
+				return 1
+			}
+			languageTag := title.Language
+			if title.Country != "" {
+				languageTag += "-" + title.Country
+			}
+			if strings.EqualFold(languageTag, currentLanguage) || strings.EqualFold(title.Language, currentLanguage) {
+				return 2
+			}
+			return 3
+		}
+		rankI, rankJ := rank(result[i]), rank(result[j])
+		if rankI != rankJ {
+			return rankI < rankJ
+		}
+		keyI, keyJ := normalization.Title(result[i].Title), normalization.Title(result[j].Title)
+		if keyI != keyJ {
+			return keyI < keyJ
+		}
+		if result[i].Language != result[j].Language {
+			return result[i].Language < result[j].Language
+		}
+		if result[i].Country != result[j].Country {
+			return result[i].Country < result[j].Country
+		}
+		return result[i].Source < result[j].Source
+	})
 	return result
+}
+
+// UniqueSearchQueries returns one display-preserving query per normalized title.
+// It is separate from GetSearchTitles so language and provenance metadata remain intact.
+func UniqueSearchQueries(titles []models.LocalizedTitle) []string {
+	queries := make([]string, 0, len(titles))
+	seen := make(map[string]bool, len(titles))
+	for _, title := range titles {
+		key := normalization.Title(title.Title)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		queries = append(queries, strings.TrimSpace(title.Title))
+	}
+	return queries
 }
 
 func (c *TMDBClient) FindByIMDbID(imdbID string) ([]models.IdentificationCandidate, error) {
@@ -1125,72 +1342,254 @@ func (c *TMDBClient) IdentifyMedia(title string, mediaType models.MediaType, yea
 }
 
 func (c *TMDBClient) IdentifyMediaContext(ctx context.Context, title string, mediaType models.MediaType, year int) (models.IdentificationResult, error) {
+	return c.IdentifyMediaWithOptionsContext(ctx, title, mediaType, year, IdentifyMediaOptions{})
+}
+
+// IdentifyMediaWithOptions preserves the legacy defaults while exposing bounded
+// pagination and confidence controls for callers that need a custom policy.
+func (c *TMDBClient) IdentifyMediaWithOptions(title string, mediaType models.MediaType, year int, options IdentifyMediaOptions) (models.IdentificationResult, error) {
+	return c.IdentifyMediaWithOptionsContext(context.Background(), title, mediaType, year, options)
+}
+
+// IdentifyMediaWithOptionsContext identifies a result using bounded pages and a
+// details lookup cap. Results remain inconclusive when the score or margin is weak.
+func (c *TMDBClient) IdentifyMediaWithOptionsContext(ctx context.Context, title string, mediaType models.MediaType, year int, options IdentifyMediaOptions) (models.IdentificationResult, error) {
 	result := models.IdentificationResult{Query: title, MediaType: mediaType, Year: year, Candidates: []models.IdentificationCandidate{}}
-	if normalization.Title(title) == "" {
-		return result, fmt.Errorf("title must not be empty")
+	if err := validateSearchTitle(title); err != nil {
+		return result, err
 	}
-	var candidates []models.IdentificationCandidate
-	switch mediaType {
-	case models.MediaTypeMovie:
-		movies, err := c.SearchMoviesByTitleContext(ctx, title, year, 1)
-		if err != nil {
-			return result, err
-		}
-		for i := range movies {
-			movie := movies[i]
-			score := identificationScore(title, movie.Title, movie.OriginalTitle, movie.ReleaseYear, year)
-			candidates = append(candidates, candidateFromMovie(movie, score))
-		}
-	case models.MediaTypeTV:
-		shows, err := c.SearchTVShowsByTitleContext(ctx, title, year, 1)
-		if err != nil {
-			return result, err
-		}
-		for i := range shows {
-			show := shows[i]
-			score := identificationScore(title, show.Name, show.OriginalName, show.ReleaseYear, year)
-			candidates = append(candidates, candidateFromTV(show, score))
-		}
-	default:
+	if year < 0 || year > 0 && (year < 1000 || year > 9999) {
+		return result, fmt.Errorf("year must be zero or between 1000 and 9999")
+	}
+	if mediaType != models.MediaTypeMovie && mediaType != models.MediaTypeTV {
 		return result, fmt.Errorf("unsupported media type %q", mediaType)
 	}
-	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Confidence > candidates[j].Confidence })
-	if len(candidates) > 5 {
-		candidates = candidates[:5]
+	options, err := normalizeIdentifyOptions(options, year)
+	if err != nil {
+		return result, err
 	}
-	result.Candidates = candidates
-	if len(candidates) == 0 {
+
+	records := make(map[string]*identificationRecord)
+	baseConfident := false
+	if year > 0 {
+		baseConfident, err = c.searchIdentificationPages(ctx, title, mediaType, year, year, options, records)
+		if err != nil {
+			return result, err
+		}
+	}
+	if !baseConfident && (year == 0 || !options.DisableYearFallback) {
+		baseConfident, err = c.searchIdentificationPages(ctx, title, mediaType, 0, year, options, records)
+		if err != nil {
+			return result, err
+		}
+	}
+
+	ordered := sortedIdentificationRecords(records)
+	detailLimit := options.MaxDetailLookups
+	if baseConfident && detailLimit > 1 {
+		detailLimit = 1
+	}
+	detailsLoaded := 0
+	for index, record := range ordered {
+		if detailsLoaded >= detailLimit {
+			break
+		}
+		if index > 0 && titleSimilarity(title, record.candidate.Title) < 0.20 &&
+			titleSimilarity(title, record.candidate.OriginalTitle) < 0.20 &&
+			(year == 0 || record.candidate.ReleaseYear != year) {
+			continue
+		}
+		if err := c.enrichIdentificationRecord(ctx, title, year, record); err != nil {
+			result.Candidates = identificationCandidates(ordered, 5)
+			return result, err
+		}
+		detailsLoaded++
+	}
+
+	ordered = sortedIdentificationRecords(records)
+	result.Candidates = identificationCandidates(ordered, 5)
+	if len(ordered) == 0 || !identificationIsConclusive(ordered, options.ConfidenceThreshold, options.MinimumConfidenceMargin) {
 		return result, nil
 	}
-	margin := 1.0
-	if len(candidates) > 1 {
-		margin = candidates[0].Confidence - candidates[1].Confidence
+	selected := ordered[0].candidate
+	result.Conclusive = true
+	result.Candidate = &selected
+	return result, nil
+}
+
+type identificationRecord struct {
+	candidate   models.IdentificationCandidate
+	aliases     []models.LocalizedTitle
+	detailsRead bool
+}
+
+func normalizeIdentifyOptions(options IdentifyMediaOptions, year int) (IdentifyMediaOptions, error) {
+	if options.MaxPages < 0 || options.MaxDetailLookups < 0 {
+		return options, fmt.Errorf("identification limits must not be negative")
 	}
-	threshold := 0.85
-	if year > 0 {
-		threshold = 0.82
+	if options.MaxPages == 0 {
+		options.MaxPages = defaultIdentifyPages
 	}
-	if candidates[0].Confidence >= threshold && margin >= 0.08 {
-		selected := candidates[0]
+	if options.MaxDetailLookups == 0 {
+		options.MaxDetailLookups = defaultDetailLookups
+	}
+	if options.MaxPages > maxIdentifyPages {
+		return options, fmt.Errorf("MaxPages cannot exceed %d", maxIdentifyPages)
+	}
+	if options.MaxDetailLookups > maxDetailLookups {
+		return options, fmt.Errorf("MaxDetailLookups cannot exceed %d", maxDetailLookups)
+	}
+	if options.ConfidenceThreshold == 0 {
+		options.ConfidenceThreshold = 0.85
+		if year > 0 {
+			options.ConfidenceThreshold = 0.82
+		}
+	}
+	if options.MinimumConfidenceMargin == 0 {
+		options.MinimumConfidenceMargin = 0.08
+	}
+	if math.IsNaN(options.ConfidenceThreshold) || math.IsInf(options.ConfidenceThreshold, 0) ||
+		math.IsNaN(options.MinimumConfidenceMargin) || math.IsInf(options.MinimumConfidenceMargin, 0) ||
+		options.ConfidenceThreshold < 0 || options.ConfidenceThreshold > 1 ||
+		options.MinimumConfidenceMargin < 0 || options.MinimumConfidenceMargin > 1 {
+		return options, fmt.Errorf("confidence thresholds must be between 0 and 1")
+	}
+	return options, nil
+}
+
+func (c *TMDBClient) searchIdentificationPages(ctx context.Context, title string, mediaType models.MediaType, filterYear, scoreYear int, options IdentifyMediaOptions, records map[string]*identificationRecord) (bool, error) {
+	for page := 1; page <= options.MaxPages; page++ {
+		var totalPages int
 		switch mediaType {
 		case models.MediaTypeMovie:
-			movie, err := c.GetMovieDetailsContext(ctx, selected.TMDBID)
+			movies, pages, err := c.searchMoviesByTitlePageContext(ctx, title, filterYear, page)
 			if err != nil {
-				return result, err
+				return false, err
 			}
-			selected = candidateFromMovie(movie, selected.Confidence)
+			totalPages = pages
+			for i := range movies {
+				movie := movies[i]
+				candidate := candidateFromMovie(movie, identificationScore(title, movie.Title, movie.OriginalTitle, movie.ReleaseYear, scoreYear))
+				mergeIdentificationRecord(records, candidate)
+			}
+			if len(movies) == 0 {
+				break
+			}
 		case models.MediaTypeTV:
-			show, err := c.GetTVShowDetailsContext(ctx, selected.TMDBID)
+			shows, pages, err := c.searchTVShowsByTitlePageContext(ctx, title, filterYear, page)
 			if err != nil {
-				return result, err
+				return false, err
 			}
-			selected = candidateFromTV(show, selected.Confidence)
+			totalPages = pages
+			for i := range shows {
+				show := shows[i]
+				candidate := candidateFromTV(show, identificationScore(title, show.Name, show.OriginalName, show.ReleaseYear, scoreYear))
+				mergeIdentificationRecord(records, candidate)
+			}
+			if len(shows) == 0 {
+				break
+			}
 		}
-		result.Candidates[0] = selected
-		result.Conclusive = true
-		result.Candidate = &selected
+		if identificationIsConclusive(sortedIdentificationRecords(records), options.ConfidenceThreshold, options.MinimumConfidenceMargin) {
+			return true, nil
+		}
+		if totalPages <= page {
+			break
+		}
 	}
-	return result, nil
+	return identificationIsConclusive(sortedIdentificationRecords(records), options.ConfidenceThreshold, options.MinimumConfidenceMargin), nil
+}
+
+func mergeIdentificationRecord(records map[string]*identificationRecord, candidate models.IdentificationCandidate) {
+	key := fmt.Sprintf("%s:%d", candidate.MediaType, candidate.TMDBID)
+	if existing, ok := records[key]; ok {
+		if existing.detailsRead || existing.candidate.Confidence >= candidate.Confidence {
+			return
+		}
+		existing.candidate = candidate
+		return
+	}
+	records[key] = &identificationRecord{candidate: candidate}
+}
+
+func sortedIdentificationRecords(records map[string]*identificationRecord) []*identificationRecord {
+	ordered := make([]*identificationRecord, 0, len(records))
+	for _, record := range records {
+		ordered = append(ordered, record)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].candidate.Confidence != ordered[j].candidate.Confidence {
+			return ordered[i].candidate.Confidence > ordered[j].candidate.Confidence
+		}
+		if ordered[i].candidate.MediaType != ordered[j].candidate.MediaType {
+			return ordered[i].candidate.MediaType < ordered[j].candidate.MediaType
+		}
+		return ordered[i].candidate.TMDBID < ordered[j].candidate.TMDBID
+	})
+	return ordered
+}
+
+func identificationCandidates(records []*identificationRecord, limit int) []models.IdentificationCandidate {
+	if len(records) > limit {
+		records = records[:limit]
+	}
+	candidates := make([]models.IdentificationCandidate, 0, len(records))
+	for _, record := range records {
+		candidates = append(candidates, record.candidate)
+	}
+	return candidates
+}
+
+func identificationIsConclusive(records []*identificationRecord, threshold, margin float64) bool {
+	if len(records) == 0 || records[0].candidate.Confidence < threshold {
+		return false
+	}
+	if len(records) > 1 && records[0].candidate.Confidence-records[1].candidate.Confidence < margin {
+		return false
+	}
+	return true
+}
+
+func (c *TMDBClient) enrichIdentificationRecord(ctx context.Context, query string, year int, record *identificationRecord) error {
+	switch record.candidate.MediaType {
+	case models.MediaTypeMovie:
+		movie, err := c.GetMovieDetailsContext(ctx, record.candidate.TMDBID)
+		if err != nil {
+			return err
+		}
+		record.candidate = candidateFromMovie(movie, 0)
+		record.aliases = movie.AlternativeTitles
+	case models.MediaTypeTV:
+		show, err := c.GetTVShowDetailsContext(ctx, record.candidate.TMDBID)
+		if err != nil {
+			return err
+		}
+		record.candidate = candidateFromTV(show, 0)
+		record.aliases = show.AlternativeTitles
+	}
+	record.candidate.Confidence = identificationScoreWithAliases(query, record.candidate, record.aliases, year)
+	record.detailsRead = true
+	return nil
+}
+
+func identificationScoreWithAliases(query string, candidate models.IdentificationCandidate, aliases []models.LocalizedTitle, requestedYear int) float64 {
+	titleScore := max(titleSimilarity(query, candidate.Title), titleSimilarity(query, candidate.OriginalTitle), titleSimilarity(query, candidate.OriginalName))
+	if len(aliases) > maxIdentificationAliases {
+		aliases = aliases[:maxIdentificationAliases]
+	}
+	for _, alias := range aliases {
+		if score := titleSimilarity(query, alias.Title); score > titleScore {
+			titleScore = score
+		}
+	}
+	if requestedYear == 0 {
+		return titleScore
+	}
+	yearScore := 0.0
+	if candidate.ReleaseYear == requestedYear {
+		yearScore = 1
+	}
+	return titleScore*0.8 + yearScore*0.2
 }
 
 func identificationScore(query, localized, original string, foundYear, requestedYear int) float64 {
@@ -1209,9 +1608,15 @@ func identificationScore(query, localized, original string, foundYear, requested
 }
 
 func titleSimilarity(left, right string) float64 {
+	if !validComparisonTitle(left) || !validComparisonTitle(right) {
+		return 0
+	}
 	left = normalization.Title(left)
 	right = normalization.Title(right)
 	if left == "" || right == "" {
+		return 0
+	}
+	if utf8.RuneCountInString(left) > maxSearchTitleRunes || utf8.RuneCountInString(right) > maxSearchTitleRunes {
 		return 0
 	}
 	if left == right {
@@ -1242,6 +1647,13 @@ func titleSimilarity(left, right string) float64 {
 	}
 	tokenSimilarity := float64(intersection) / float64(union)
 	return editSimilarity*0.6 + tokenSimilarity*0.4
+}
+
+func validComparisonTitle(value string) bool {
+	if len(value) > maxSearchTitleRunes*utf8.UTFMax || !utf8.ValidString(value) {
+		return false
+	}
+	return utf8.RuneCountInString(value) <= maxSearchTitleRunes
 }
 
 func levenshtein(left, right []rune) int {

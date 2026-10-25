@@ -24,46 +24,50 @@ type ExternalIDs struct {
 }
 
 type Movie struct {
-	ID                int              `json:"id"`
-	TMDBID            int              `json:"tmdb_id,omitempty"`
-	Title             string           `json:"title"`
-	OriginalTitle     string           `json:"original_title,omitempty"`
-	OriginalLanguage  string           `json:"original_language,omitempty"`
-	IMDbID            string           `json:"imdb_id,omitempty"`
-	ReleaseYear       int              `json:"release_year,omitempty"`
-	Overview          string           `json:"overview"`
-	ReleaseDate       string           `json:"release_date"`
-	PosterPath        string           `json:"poster_path"`
-	BackdropPath      string           `json:"backdrop_path"`
-	VoteAverage       float64          `json:"vote_average"`
-	TrailerURL        string           `json:"trailer_url"`
-	Popularity        float64          `json:"popularity"`
-	CreatedAt         time.Time        `json:"created_at"`
-	LastSyncedAt      time.Time        `json:"last_synced_at,omitempty"`
-	GenreIDs          []int            `json:"genre_ids"`
-	AlternativeTitles []LocalizedTitle `json:"alternative_titles,omitempty"`
+	ID                        int              `json:"id"`
+	TMDBID                    int              `json:"tmdb_id,omitempty"`
+	Title                     string           `json:"title"`
+	OriginalTitle             string           `json:"original_title,omitempty"`
+	OriginalLanguage          string           `json:"original_language,omitempty"`
+	IMDbID                    string           `json:"imdb_id,omitempty"`
+	ReleaseYear               int              `json:"release_year,omitempty"`
+	Overview                  string           `json:"overview"`
+	ReleaseDate               string           `json:"release_date"`
+	PosterPath                string           `json:"poster_path"`
+	BackdropPath              string           `json:"backdrop_path"`
+	VoteAverage               float64          `json:"vote_average"`
+	TrailerURL                string           `json:"trailer_url"`
+	Popularity                float64          `json:"popularity"`
+	CreatedAt                 time.Time        `json:"created_at"`
+	LastSyncedAt              time.Time        `json:"last_synced_at,omitempty"`
+	GenreIDs                  []int            `json:"genre_ids"`
+	AlternativeTitles         []LocalizedTitle `json:"alternative_titles,omitempty"`
+	AlternativeTitlesComplete bool             `json:"-"`
+	DetailsComplete           bool             `json:"-"`
 }
 
 type TVShow struct {
-	ID                int              `json:"id"`
-	TMDBID            int              `json:"tmdb_id,omitempty"`
-	Name              string           `json:"name"`
-	OriginalName      string           `json:"original_name,omitempty"`
-	OriginalTitle     string           `json:"original_title,omitempty"`
-	OriginalLanguage  string           `json:"original_language,omitempty"`
-	IMDbID            string           `json:"imdb_id,omitempty"`
-	ReleaseYear       int              `json:"release_year,omitempty"`
-	Overview          string           `json:"overview"`
-	FirstAirDate      string           `json:"first_air_date"`
-	PosterPath        string           `json:"poster_path"`
-	BackdropPath      string           `json:"backdrop_path"`
-	VoteAverage       float64          `json:"vote_average"`
-	TrailerURL        string           `json:"trailer_url"`
-	Popularity        float64          `json:"popularity"`
-	CreatedAt         time.Time        `json:"created_at"`
-	LastSyncedAt      time.Time        `json:"last_synced_at,omitempty"`
-	GenreIDs          []int            `json:"genre_ids"`
-	AlternativeTitles []LocalizedTitle `json:"alternative_titles,omitempty"`
+	ID                        int              `json:"id"`
+	TMDBID                    int              `json:"tmdb_id,omitempty"`
+	Name                      string           `json:"name"`
+	OriginalName              string           `json:"original_name,omitempty"`
+	OriginalTitle             string           `json:"original_title,omitempty"`
+	OriginalLanguage          string           `json:"original_language,omitempty"`
+	IMDbID                    string           `json:"imdb_id,omitempty"`
+	ReleaseYear               int              `json:"release_year,omitempty"`
+	Overview                  string           `json:"overview"`
+	FirstAirDate              string           `json:"first_air_date"`
+	PosterPath                string           `json:"poster_path"`
+	BackdropPath              string           `json:"backdrop_path"`
+	VoteAverage               float64          `json:"vote_average"`
+	TrailerURL                string           `json:"trailer_url"`
+	Popularity                float64          `json:"popularity"`
+	CreatedAt                 time.Time        `json:"created_at"`
+	LastSyncedAt              time.Time        `json:"last_synced_at,omitempty"`
+	GenreIDs                  []int            `json:"genre_ids"`
+	AlternativeTitles         []LocalizedTitle `json:"alternative_titles,omitempty"`
+	AlternativeTitlesComplete bool             `json:"-"`
+	DetailsComplete           bool             `json:"-"`
 }
 
 // SearchTitles is a normalized set of useful names for one TMDB record.

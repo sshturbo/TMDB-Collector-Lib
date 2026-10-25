@@ -57,24 +57,21 @@ func run() error {
 		return err
 	}
 
-	movies, err := client.DiscoverMoviesContext(ctx, 1)
+	collection, err := client.CollectMoviesProgressiveContext(ctx, 1, func(ctx context.Context, page int, batch []models.Movie) error {
+		if err := store.SaveMoviesBulk(batch); err != nil {
+			return err
+		}
+		relations := make([]models.MovieGenre, 0)
+		for _, movie := range batch {
+			for _, genreID := range movie.GenreIDs {
+				relations = append(relations, models.MovieGenre{MovieID: movie.ID, GenreID: genreID})
+			}
+		}
+		return store.SaveMovieGenresBulk(relations)
+	})
 	if err != nil {
 		return err
 	}
-	if err := store.SaveMoviesBulk(movies); err != nil {
-		return err
-	}
-
-	relations := make([]models.MovieGenre, 0)
-	for _, movie := range movies {
-		for _, genreID := range movie.GenreIDs {
-			relations = append(relations, models.MovieGenre{MovieID: movie.ID, GenreID: genreID})
-		}
-	}
-	if err := store.SaveMovieGenresBulk(relations); err != nil {
-		return err
-	}
-
-	fmt.Printf("Saved %d movies and %d genres\n", len(movies), len(genres))
+	fmt.Printf("Processed %d movies across %d pages; saved %d genres\n", collection.ItemsProcessed, collection.PagesSucceeded, len(genres))
 	return nil
 }

@@ -111,7 +111,8 @@ func TestGetMovieDetailsAndSearchTitlesPreserveLanguageAndOrigins(t *testing.T) 
 			"external_ids":{"imdb_id":"tt1745960"},
 			"translations":{"translations":[
 				{"iso_639_1":"en","iso_3166_1":"US","data":{"title":"Top Gun: Maverick","overview":"English synopsis"}},
-				{"iso_639_1":"pt","iso_3166_1":"BR","data":{"title":"Ases Indomáveis","overview":"Sinopse"}}]},
+				{"iso_639_1":"pt","iso_3166_1":"BR","data":{"title":"Ases Indomáveis","overview":"Sinopse"}},
+				{"iso_639_1":"pt","iso_3166_1":"PT","data":{"title":"Ases Indomáveis","overview":"Sinopse portuguesa"}}]},
 			"alternative_titles":{"titles":[{"iso_3166_1":"BR","title":"Ases Indomáveis 2"}]}
 		}`))
 	}))
@@ -124,13 +125,31 @@ func TestGetMovieDetailsAndSearchTitlesPreserveLanguageAndOrigins(t *testing.T) 
 	if metadata.TMDBID != 361743 || metadata.IMDbID != "tt1745960" || metadata.ReleaseYear != 2022 || metadata.OriginalLanguage != "en" {
 		t.Fatalf("identity metadata missing: %#v", metadata)
 	}
-	if len(metadata.SearchTitles) != 3 {
-		t.Fatalf("expected localized/original/alternative titles with duplicates removed, got %#v", metadata.SearchTitles)
+	if len(metadata.SearchTitles) != 6 {
+		t.Fatalf("expected localized/original/alternative provenance to be preserved, got %#v", metadata.SearchTitles)
 	}
 	if metadata.SearchTitles[0].Language != "pt-BR" || metadata.SearchTitles[1].Language != "en" {
 		t.Errorf("localized and original language provenance missing: %#v", metadata.SearchTitles)
 	}
-	if metadata.SearchTitles[2].Title != "Ases Indomáveis 2" || metadata.SearchTitles[2].Country != "BR" {
+	provenances := map[string]int{}
+	for _, title := range metadata.SearchTitles {
+		if title.Title == "Ases Indomáveis" && (title.Country == "BR" || title.Country == "PT") {
+			provenances[title.Country]++
+		}
+	}
+	if provenances["BR"] != 1 || provenances["PT"] != 1 {
+		t.Errorf("translation provenance missing or duplicated: %#v", metadata.SearchTitles)
+	}
+	if queries := UniqueSearchQueries(metadata.SearchTitles); len(queries) != 3 {
+		t.Errorf("normalized duplicate search queries were not collapsed: %#v", queries)
+	}
+	foundAlternative := false
+	for _, title := range metadata.SearchTitles {
+		if title.Title == "Ases Indomáveis 2" && title.Country == "BR" && title.Source == "alternative" {
+			foundAlternative = true
+		}
+	}
+	if !foundAlternative {
 		t.Errorf("alternative title provenance missing: %#v", metadata.SearchTitles)
 	}
 }
@@ -147,6 +166,27 @@ func TestGetDetailsFallsBackToEnglishTranslation(t *testing.T) {
 	}
 	if movie.Title != "English fallback" || movie.Overview != "English synopsis" {
 		t.Fatalf("translation fallback failed: %#v", movie)
+	}
+}
+
+func TestFreshDetailsBypassesCachedLocalizedResponse(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		version := calls.Add(1)
+		_, _ = fmt.Fprintf(w, `{"id":12,"title":"Version %d","original_title":"Original"}`, version)
+	}))
+	defer server.Close()
+	client := testClient(server, ClientOptions{CacheTTL: time.Hour})
+	first, err := client.GetMovieDetailsContext(context.Background(), 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.GetMovieDetailsFreshContext(context.Background(), 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Title != "Version 1" || second.Title != "Version 2" || calls.Load() != 2 || !second.DetailsComplete {
+		t.Fatalf("fresh details used stale cache or missed completeness marker: first=%#v second=%#v calls=%d", first, second, calls.Load())
 	}
 }
 
@@ -203,6 +243,89 @@ func TestIdentifyMediaEnrichesConclusiveMatchWithIMDbID(t *testing.T) {
 	}
 	if !result.Conclusive || result.Candidate == nil || result.Candidate.TMDBID != 11 || result.Candidate.IMDbID != "tt1160419" {
 		t.Fatalf("conclusive match was not enriched: %#v", result)
+	}
+}
+
+func TestIdentifyMediaChecksLaterPagesAndAlternativeTitles(t *testing.T) {
+	var pageOne, pageTwo, detailCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/3/search/movie":
+			switch r.URL.Query().Get("page") {
+			case "1":
+				pageOne.Add(1)
+				_, _ = w.Write([]byte(`{"page":1,"total_pages":2,"results":[{"id":1,"title":"Unrelated title","release_date":"2020-01-01"}]}`))
+			case "2":
+				pageTwo.Add(1)
+				_, _ = w.Write([]byte(`{"page":2,"total_pages":2,"results":[{"id":2,"title":"Top Gun","original_title":"Top Gun","release_date":"2022-05-27"}]}`))
+			default:
+				t.Errorf("unexpected search page %q", r.URL.Query().Get("page"))
+			}
+		case "/3/movie/2":
+			detailCalls.Add(1)
+			_, _ = w.Write([]byte(`{"id":2,"title":"Top Gun","original_title":"Top Gun","release_date":"2022-05-27","alternative_titles":{"titles":[{"iso_3166_1":"US","title":"Top Gun: Maverick"}]}}`))
+		default:
+			t.Errorf("unexpected request %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	result, err := testClient(server, ClientOptions{}).IdentifyMediaWithOptions("Top Gun: Maverick", models.MediaTypeMovie, 0, IdentifyMediaOptions{
+		MaxPages: 2, MaxDetailLookups: 1, ConfidenceThreshold: 0.95, MinimumConfidenceMargin: 0.1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Conclusive || result.Candidate == nil || result.Candidate.TMDBID != 2 || result.Candidate.Confidence != 1 {
+		t.Fatalf("later-page alternative title was not identified confidently: %#v", result)
+	}
+	if pageOne.Load() != 1 || pageTwo.Load() != 1 || detailCalls.Load() != 1 {
+		t.Fatalf("unexpected search/detail work: page1=%d page2=%d details=%d", pageOne.Load(), pageTwo.Load(), detailCalls.Load())
+	}
+}
+
+func TestSearchTitleLengthIsBoundedBeforeRequest(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1) }))
+	defer server.Close()
+	_, err := testClient(server, ClientOptions{}).SearchMoviesContext(context.Background(), strings.Repeat("界", maxSearchTitleRunes+1), 1)
+	if err == nil || calls.Load() != 0 {
+		t.Fatalf("oversized title was not rejected locally: err=%v calls=%d", err, calls.Load())
+	}
+}
+
+func TestIdenticalConcurrentFreshRequestsShareOneInFlightCall(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		time.Sleep(40 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"results":[1,2,3]}`))
+	}))
+	defer server.Close()
+	client := testClient(server, ClientOptions{MaxConcurrentRequests: 8})
+	const workers = 16
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer group.Done()
+			<-start
+			var response struct {
+				Results []int `json:"results"`
+			}
+			if err := client.doJSONFresh(context.Background(), "search/movie", url.Values{"query": []string{"same"}}, &response); err != nil {
+				t.Errorf("request failed: %v", err)
+			}
+			if len(response.Results) != 3 {
+				t.Errorf("joined response was not decoded: %#v", response)
+			}
+		}()
+	}
+	close(start)
+	group.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("identical in-flight requests were not shared: calls=%d", calls.Load())
 	}
 }
 
@@ -371,6 +494,87 @@ func TestCollectionReportsMetricsAndContinuesAfterFailedPage(t *testing.T) {
 	}
 }
 
+func TestProgressiveCollectionCancelsAfterProcessedBatch(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = fmt.Fprintf(w, `{"results":[{"id":%s,"title":"Movie"}]}`, r.URL.Query().Get("page"))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	processed := 0
+	report, err := testClient(server, ClientOptions{}).CollectMoviesProgressiveContext(ctx, 5, func(_ context.Context, page int, movies []models.Movie) error {
+		if page != 1 || len(movies) != 1 {
+			t.Fatalf("unexpected progressive batch: page=%d movies=%#v", page, movies)
+		}
+		processed += len(movies)
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || calls.Load() != 1 || processed != 1 {
+		t.Fatalf("cancellation did not stop after processed page: err=%v calls=%d processed=%d", err, calls.Load(), processed)
+	}
+	if report.PagesSucceeded != 1 || report.ItemsProcessed != 1 {
+		t.Fatalf("progress report lost completed batch: %#v", report)
+	}
+}
+
+func TestProgressiveCollectionCanReplaySpecificPages(t *testing.T) {
+	var requested []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		requested = append(requested, page)
+		_, _ = fmt.Fprintf(w, `{"results":[{"id":%s,"title":"Movie"}]}`, page)
+	}))
+	defer server.Close()
+	processed := []int{}
+	report, err := testClient(server, ClientOptions{}).ProcessMoviePagesContext(context.Background(), []int{3, 1, 3}, func(_ context.Context, page int, movies []models.Movie) error {
+		if len(movies) != 1 {
+			t.Fatalf("page %d returned %d movies", page, len(movies))
+		}
+		processed = append(processed, page)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(requested, ",") != "1,3" || len(processed) != 2 || report.PagesRequested != 2 {
+		t.Fatalf("page replay was not deduplicated and ordered: requested=%v processed=%v report=%#v", requested, processed, report)
+	}
+}
+
+func TestProgressiveCallbackFailurePreservesEarlierBatchesAndCanRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		_, _ = fmt.Fprintf(w, `{"results":[{"id":%s,"title":"Movie"}]}`, page)
+	}))
+	defer server.Close()
+	processed := []int{}
+	failure := errors.New("storage failed")
+	client := testClient(server, ClientOptions{})
+	report, err := client.CollectMoviesProgressiveContext(context.Background(), 3, func(_ context.Context, page int, _ []models.Movie) error {
+		if page == 2 {
+			return failure
+		}
+		processed = append(processed, page)
+		return nil
+	})
+	if !errors.Is(err, failure) || len(processed) != 1 || processed[0] != 1 || len(report.Failures) != 1 || report.Failures[0].Page != 2 {
+		t.Fatalf("callback failure lost or misreported previous work: report=%#v processed=%v err=%v", report, processed, err)
+	}
+	retry, err := client.ProcessMoviePagesContext(context.Background(), []int{report.Failures[0].Page}, func(_ context.Context, page int, movies []models.Movie) error {
+		if page != 2 || len(movies) != 1 {
+			t.Fatalf("unexpected retry batch: page=%d movies=%#v", page, movies)
+		}
+		processed = append(processed, page)
+		return nil
+	})
+	if err != nil || retry.PagesSucceeded != 1 || len(processed) != 2 || processed[1] != 2 {
+		t.Fatalf("failed page retry did not recover: retry=%#v processed=%v err=%v", retry, processed, err)
+	}
+}
+
 func TestCacheExpiresAndCanBeCleared(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -460,6 +664,24 @@ func TestErrorTransportURLRedactsAPIKey(t *testing.T) {
 	err := client.doJSON(context.Background(), "search/movie", url.Values{}, &response)
 	if err == nil || strings.Contains(err.Error(), "test-secret") {
 		t.Fatalf("transport error leaked API key: %v", err)
+	}
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if strings.Contains(cause.Error(), "test-secret") {
+			t.Fatalf("wrapped transport cause leaked API key: %v", cause)
+		}
+	}
+}
+
+func TestConfiguredBaseURLRejectsNonHTTPAndEmbeddedCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+	client := testClient(server, ClientOptions{})
+	for _, baseURL := range []string{"file:///tmp/tmdb", "https://user:password@example.com/3", "https://example.com/3?api_key=leak"} {
+		client.baseURL = baseURL
+		var response any
+		if err := client.doJSON(context.Background(), "movie/1", url.Values{}, &response); err == nil {
+			t.Errorf("expected invalid base URL to fail: %q", baseURL)
+		}
 	}
 }
 
